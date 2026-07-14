@@ -1,0 +1,5 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -ID:/Projects/GlobOpt/GlobalOptimizers/include
+    - -ID:/Projects/GlobOpt/eigen
