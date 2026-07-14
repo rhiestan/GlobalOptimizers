@@ -57,3 +57,8 @@ if (GLOBOPT_BUILD_EXAMPLES)
     add_executable(lbfgs_example examples/lbfgs_example.cpp)
     target_link_libraries(lbfgs_example PRIVATE globopt::globopt)
 endif()
+
+if (GLOBOPT_BUILD_TESTS)
+    add_executable(run_ampgo_benchmarks benchmarks/run_ampgo.cpp)
+    target_link_libraries(run_ampgo_benchmarks PRIVATE globopt::globopt)
+endif()

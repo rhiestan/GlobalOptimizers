@@ -9,9 +9,12 @@
 #include "core/params.hpp"
 #include "core/result.hpp"
 #include "core/optimizer.hpp"
+#include "core/numerical_gradient.hpp"
 
 #include "local/lbfgs.hpp"
 #include "local/lbfgsb.hpp"
+
+#include "global/ampgo.hpp"
 
 #include "factory.hpp"
 

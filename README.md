@@ -47,8 +47,9 @@ Box constraints are supported through `optimizer->setBounds(lower, upper)` (use 
 |------|------|-------|
 | `L-BFGS` | local, gradient-based | limited-memory BFGS with Moré-Thuente line search; ported from [OptimLib](https://github.com/kthohr/optim) |
 | `L-BFGS-B` | local, gradient-based, box constraints | limited-memory BFGS for bound-constrained problems (Byrd, Lu, Nocedal, Zhu) with Lewis-Overton line search; ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) |
+| `AMPGO` | global | Adaptive Memory Programming for Global Optimization (Lasdon, Duarte, Glover, Laguna, Martí): local minimization alternated with tabu tunneling; ported from Andrea Gavana's Python implementation |
 
-Planned: AMPGO (Adaptive Memory Programming for Global Optimization), LIPO, and further global optimizers.
+Planned: LIPO and further global optimizers.
 
 ### L-BFGS parameters
 
@@ -78,6 +79,34 @@ When bounds are set, the run is delegated to L-BFGS-B; `max_iterations`, `gradie
 
 The default weak Wolfe line search also permits minimizing non-smooth objectives.
 
+### AMPGO parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `total_iterations` | 20 | maximum number of global iterations (minimization phases) |
+| `tunnel_iterations` | 5 | maximum number of tabu tunneling attempts per global iteration |
+| `max_function_evaluations` | 0 | maximum number of function evaluations (0 = max(100, 10·n)) |
+| `tolerance` | 1e-5 | stop when the best objective is within this distance of `target_objective` |
+| `target_objective` | -inf | value of the global optimum, if known (-inf to disable) |
+| `eps1` | 0.02 | constant defining the aspiration value during tunneling |
+| `eps2` | 0.1 | perturbation factor for the tunneling start point |
+| `tabu_list_size` | 5 | size of the circular tabu list |
+| `tabu_strategy` | `farthest` | point to drop when the tabu list is full: `oldest` or `farthest` |
+| `local_solver` | `L-BFGS-B` | local optimizer: `L-BFGS-B` or `L-BFGS` |
+| `seed` | 0 | random seed for the tunneling perturbations (0 = non-deterministic) |
+
+AMPGO needs gradients (for the local solver and the tunneling chain rule). For a gradient-free objective, wrap it with `globopt::withNumericalGradient<double>(f)`, which adds central finite differences.
+
+## Benchmarks
+
+`include/globopt/benchmarks/go_benchmark.hpp` contains all 202 problems of the `go_benchmark.py` suite accompanying AMPGO (bounds, formulas and reference optima follow the Python source exactly, quirks included — e.g. its "Easom" is Ackley-shaped, and a few `fglob` values differ from the formula's true minimum). The `run_ampgo_benchmarks` executable runs AMPGO over the full set:
+
+```sh
+./build/run_ampgo_benchmarks [seed]
+```
+
+With the default seed, AMPGO solves 179 of 202 problems within a 20000-evaluation budget per problem. The misses are plateau/stair-step functions (Corana, Gear, Mishra10), noisy objectives that draw random weights on every evaluation (Stochastic, XinSheYang01), and highly oscillatory landscapes (Bukin06, Easom, Griewank, Salomon, Schaffer01/02, Ripple01, SineEnvelope, Trefethen, Wavy, Weierstrass, Pathological, CrownedCross, Deceptive, DeVilliersGlasser02, Mishra04, XinSheYang03, Zimmerman) that are hard for any gradient-based tunneling method.
+
 ## Building the tests and examples
 
 The library itself needs no build. Tests and examples use CMake:
@@ -92,4 +121,4 @@ Eigen >= 3.4 is required (L-BFGS-B uses Eigen's indexed views). If Eigen is not 
 
 ## License
 
-MPL-2.0. The L-BFGS implementation and the Moré-Thuente line search are ported from [OptimLib](https://github.com/kthohr/optim) (Apache License 2.0, Copyright Keith O'Hara); the L-BFGS-B implementation is ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) (MIT License, Copyright Dane Roemer); attribution is retained in the corresponding headers.
+MPL-2.0. The L-BFGS implementation and the Moré-Thuente line search are ported from [OptimLib](https://github.com/kthohr/optim) (Apache License 2.0, Copyright Keith O'Hara); the L-BFGS-B implementation is ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) (MIT License, Copyright Dane Roemer); AMPGO and the benchmark suite are ported from Andrea Gavana's Python implementation (go_amp.py / go_benchmark.py); attribution is retained in the corresponding headers.

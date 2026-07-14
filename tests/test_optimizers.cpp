@@ -3,9 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <globopt/globopt.hpp>
+#include <globopt/benchmarks/go_benchmark.hpp>
 
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -234,6 +236,121 @@ void testLbfgsbFloatScalar()
     check(res.x.norm() < 1e-2f, "lbfgsb sphere<float>: solution near origin");
 }
 
+void testAmpgoBird()
+{
+    // mirrors go_amp.py's __main__: Bird function, target set to the known
+    // global optimum, 20000 evaluations budget
+    const auto& bird = globopt::benchmarks::problem("Bird");
+
+    auto objective = globopt::withNumericalGradient<double>(bird.objective);
+
+    auto opt = globopt::OptimizerFactory<double>::create("AMPGO");
+    opt->setBounds(bird.lower, bird.upper);
+    opt->setParam("target_objective", bird.fglob);
+    opt->setParam("tolerance", 1e-6);
+    opt->setParam("max_function_evaluations", 20000);
+    opt->setParam("total_iterations", 2000);
+    opt->setParam("seed", 7);
+
+    std::mt19937_64 rng(7);
+    const auto res = opt->run(objective, bird.randomStart(rng));
+
+    check(res.success(), "ampgo bird: global optimum found (" + std::string(toString(res.status)) + ")");
+    check(res.fval < bird.fglob + 1e-6, "ampgo bird: objective at global optimum");
+    check(res.functionEvaluations <= 20000 + 100, "ampgo bird: evaluation budget respected");
+}
+
+void testAmpgoSixHumpCamel()
+{
+    const auto& camel = globopt::benchmarks::problem("SixHumpCamel");
+
+    auto objective = globopt::withNumericalGradient<double>(camel.objective);
+
+    globopt::AMPGO<double> opt;
+    opt.setBounds(camel.lower, camel.upper);
+    opt.setParam("target_objective", camel.fglob);
+    opt.setParam("tolerance", 1e-5);
+    opt.setParam("max_function_evaluations", 20000);
+    opt.setParam("total_iterations", 2000);
+    opt.setParam("seed", 11);
+
+    std::mt19937_64 rng(11);
+    const auto res = opt.run(objective, camel.randomStart(rng));
+
+    check(res.success(), "ampgo six-hump camel: global optimum found");
+}
+
+void testAmpgoAnalyticGradient()
+{
+    // AMPGO on Rosenbrock with an analytic gradient and no target: it should
+    // run its budget and still land on the global minimum (1, 1)
+    globopt::AMPGO<double> opt;
+    opt.setParam("max_function_evaluations", 5000);
+    opt.setParam("seed", 3);
+
+    globopt::Vector<double> x0(2);
+    x0 << -1.2, 1.0;
+
+    const auto res = opt.run(&rosenbrock<double>, x0);
+
+    check(res.fval < 1e-8, "ampgo rosenbrock (analytic gradient): minimum found");
+    check(!res.message.empty(), "ampgo rosenbrock: tunneling stats reported");
+}
+
+void testAmpgoParamValidation()
+{
+    globopt::AMPGO<double> opt;
+    opt.setParam("tabu_strategy", "sideways");
+
+    globopt::Vector<double> x0(2);
+    x0 << 0.0, 0.0;
+
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "ampgo: invalid tabu_strategy rejected");
+
+    globopt::AMPGO<double> opt2;
+    opt2.setParam("local_solver", "nelder-mead");
+    check(opt2.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "ampgo: invalid local_solver rejected");
+}
+
+void testBenchmarkSuite()
+{
+    const auto& problems = globopt::benchmarks::allProblems();
+
+    check(problems.size() == 202, "benchmarks: all 202 problems ported ("
+          + std::to_string(problems.size()) + ")");
+
+    std::mt19937_64 rng(1);
+    bool boundsOk = true, evalOk = true, optimaOk = true;
+
+    for (const auto& p : problems) {
+        if (p.lower.size() != p.upper.size() || p.lower.size() == 0
+            || !(p.lower.array() <= p.upper.array()).all()) {
+            boundsOk = false;
+        }
+
+        // every objective must be callable at an in-bounds point
+        const auto x = p.randomStart(rng);
+        const double f = p.objective(x);
+        if (std::isnan(f) && p.name != "Csendes" && p.name != "Damavandi") {
+            evalOk = false;
+            std::printf("       NaN at random start: %s\n", p.name.c_str());
+        }
+
+        for (const auto& opt : p.globalOptima) {
+            if (opt.size() != p.lower.size()) {
+                optimaOk = false;
+                std::printf("       optimum size mismatch: %s\n", p.name.c_str());
+            }
+        }
+    }
+
+    check(boundsOk, "benchmarks: bounds well-formed");
+    check(evalOk, "benchmarks: objectives evaluable in bounds");
+    check(optimaOk, "benchmarks: stated optima match dimensions");
+}
+
 void testUnboundedBooth()
 {
     auto opt = globopt::OptimizerFactory<double>::create("l_bfgs");
@@ -291,9 +408,11 @@ void testParamInterface()
     check(!opt->listParams().empty(), "params: listParams non-empty");
     check(std::string(opt->name()) == "L-BFGS", "optimizer: name");
 
-    check(globopt::OptimizerFactory<double>::available().size() == 2, "factory: two optimizers available");
+    check(globopt::OptimizerFactory<double>::available().size() == 3, "factory: three optimizers available");
     check(std::string(globopt::OptimizerFactory<double>::create("l-bfgs-b")->name()) == "L-BFGS-B",
           "factory: L-BFGS-B by name");
+    check(std::string(globopt::OptimizerFactory<double>::create("ampgo")->name()) == "AMPGO",
+          "factory: AMPGO by name");
 }
 
 void testInvalidInput()
@@ -322,6 +441,11 @@ int main()
     testLbfgsbConstrainedRosenbrock();
     testBoundaryOptimum();
     testLbfgsDelegatesBounded();
+    testBenchmarkSuite();
+    testAmpgoBird();
+    testAmpgoSixHumpCamel();
+    testAmpgoAnalyticGradient();
+    testAmpgoParamValidation();
     testFloatScalar();
     testLbfgsbFloatScalar();
     testParamInterface();
