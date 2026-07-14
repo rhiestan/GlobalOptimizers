@@ -48,8 +48,9 @@ Box constraints are supported through `optimizer->setBounds(lower, upper)` (use 
 | `L-BFGS` | local, gradient-based | limited-memory BFGS with Moré-Thuente line search; ported from [OptimLib](https://github.com/kthohr/optim) |
 | `L-BFGS-B` | local, gradient-based, box constraints | limited-memory BFGS for bound-constrained problems (Byrd, Lu, Nocedal, Zhu) with Lewis-Overton line search; ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) |
 | `AMPGO` | global | Adaptive Memory Programming for Global Optimization (Lasdon, Duarte, Glover, Laguna, Martí): local minimization alternated with tabu tunneling; ported from Andrea Gavana's Python implementation |
+| `LIPO` | global, derivative-free, requires finite bounds | MaxLIPO+TR (Malherbe & Vayatis LIPO upper bound + trust-region refinement); ported from [dlib](http://dlib.net)'s `global_function_search` |
 
-Planned: LIPO and further global optimizers.
+Planned: further global optimizers.
 
 ### L-BFGS parameters
 
@@ -96,6 +97,22 @@ The default weak Wolfe line search also permits minimizing non-smooth objectives
 | `seed` | 0 | random seed for the tunneling perturbations (0 = non-deterministic) |
 
 AMPGO needs gradients (for the local solver and the tunneling chain rule). For a gradient-free objective, wrap it with `globopt::withNumericalGradient<double>(f)`, which adds central finite differences.
+
+### LIPO parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_function_evaluations` | 0 | maximum number of function evaluations (0 = max(100, 10·n)) |
+| `target_objective` | -inf | value of the global optimum, if known (-inf to disable) |
+| `tolerance` | 1e-5 | stop when the best objective is within this distance of `target_objective` |
+| `pure_random_search_probability` | 0.02 | probability of ignoring the upper bound and sampling uniformly at random |
+| `upper_bound_samples` | 5000 | Monte Carlo samples used to maximize the upper bound per iteration |
+| `relative_noise_magnitude` | 0.001 | assumed relative noise in objective values when fitting the upper bound |
+| `trust_region_epsilon` | 0 | minimum predicted improvement required to take a trust-region step |
+| `upper_bound_solver_epsilon` | 1e-4 | accuracy of the QP solver that fits the upper bound |
+| `seed` | 0 | random seed (0 = non-deterministic) |
+
+LIPO is derivative-free (the objective is never asked for a gradient) and requires finite box bounds. It targets *expensive* objectives: each iteration spends considerable model-fitting work to squeeze the most out of every function evaluation, so use it with budgets of a few hundred evaluations rather than tens of thousands. Integer-variable support from the dlib original is not ported.
 
 ## Benchmarks
 

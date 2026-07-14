@@ -15,6 +15,7 @@
 #include "local/lbfgsb.hpp"
 
 #include "global/ampgo.hpp"
+#include "global/lipo.hpp"
 
 #include "factory.hpp"
 

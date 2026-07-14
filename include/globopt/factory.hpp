@@ -7,6 +7,7 @@
 
 #include "core/optimizer.hpp"
 #include "global/ampgo.hpp"
+#include "global/lipo.hpp"
 #include "local/lbfgs.hpp"
 #include "local/lbfgsb.hpp"
 
@@ -22,7 +23,8 @@ namespace globopt {
 enum class Algorithm {
     LBFGS,
     LBFGSB,
-    AMPGO
+    AMPGO,
+    LIPO
 };
 
 template <typename Scalar = double>
@@ -37,6 +39,8 @@ public:
                 return std::make_unique<LBFGSB<Scalar>>();
             case Algorithm::AMPGO:
                 return std::make_unique<globopt::AMPGO<Scalar>>();
+            case Algorithm::LIPO:
+                return std::make_unique<globopt::LIPO<Scalar>>();
         }
         throw std::invalid_argument("globopt: unknown algorithm");
     }
@@ -56,13 +60,16 @@ public:
         if (key == "ampgo") {
             return create(Algorithm::AMPGO);
         }
+        if (key == "lipo" || key == "maxlipo" || key == "maxlipotr") {
+            return create(Algorithm::LIPO);
+        }
 
         throw std::invalid_argument("globopt: unknown optimizer '" + name + "'");
     }
 
     static std::vector<std::string> available()
     {
-        return {"L-BFGS", "L-BFGS-B", "AMPGO"};
+        return {"L-BFGS", "L-BFGS-B", "AMPGO", "LIPO"};
     }
 
 private:

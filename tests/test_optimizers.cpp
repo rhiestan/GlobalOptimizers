@@ -351,6 +351,69 @@ void testBenchmarkSuite()
     check(optimaOk, "benchmarks: stated optima match dimensions");
 }
 
+void testLipoBird()
+{
+    const auto& bird = globopt::benchmarks::problem("Bird");
+
+    auto opt = globopt::OptimizerFactory<double>::create("LIPO");
+    opt->setBounds(bird.lower, bird.upper);
+    opt->setParam("target_objective", bird.fglob);
+    opt->setParam("tolerance", 1e-4);
+    opt->setParam("max_function_evaluations", 300);
+    opt->setParam("seed", 5);
+
+    auto objective = [&](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        return bird.objective(x);
+    };
+
+    std::mt19937_64 rng(5);
+    const auto res = opt->run(objective, bird.randomStart(rng));
+
+    check(res.success(), "lipo bird: global optimum found (" + std::string(toString(res.status))
+          + ", f = " + std::to_string(res.fval) + ")");
+    check(res.functionEvaluations <= 300, "lipo bird: evaluation budget respected");
+}
+
+void testLipoHolderTable()
+{
+    const auto& holder = globopt::benchmarks::problem("HolderTable");
+
+    globopt::LIPO<double> opt;
+    opt.setBounds(holder.lower, holder.upper);
+    opt.setParam("target_objective", holder.fglob);
+    opt.setParam("tolerance", 1e-4);
+    opt.setParam("max_function_evaluations", 300);
+    opt.setParam("seed", 9);
+
+    auto objective = [&](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        return holder.objective(x);
+    };
+
+    std::mt19937_64 rng(9);
+    const auto res = opt.run(objective, holder.randomStart(rng));
+
+    check(res.success(), "lipo holder table: global optimum found (f = "
+          + std::to_string(res.fval) + ")");
+}
+
+void testLipoRequiresBounds()
+{
+    globopt::LIPO<double> opt;
+
+    globopt::Vector<double> x0(2);
+    x0 << 0.0, 0.0;
+
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "lipo: missing bounds rejected");
+
+    globopt::Vector<double> lb(2), ub(2);
+    lb << -1.0, -1.0;
+    ub << 1.0, std::numeric_limits<double>::infinity();
+    opt.setBounds(lb, ub);
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "lipo: non-finite bounds rejected");
+}
+
 void testUnboundedBooth()
 {
     auto opt = globopt::OptimizerFactory<double>::create("l_bfgs");
@@ -408,7 +471,9 @@ void testParamInterface()
     check(!opt->listParams().empty(), "params: listParams non-empty");
     check(std::string(opt->name()) == "L-BFGS", "optimizer: name");
 
-    check(globopt::OptimizerFactory<double>::available().size() == 3, "factory: three optimizers available");
+    check(globopt::OptimizerFactory<double>::available().size() == 4, "factory: four optimizers available");
+    check(std::string(globopt::OptimizerFactory<double>::create("MaxLIPO")->name()) == "LIPO",
+          "factory: LIPO by name");
     check(std::string(globopt::OptimizerFactory<double>::create("l-bfgs-b")->name()) == "L-BFGS-B",
           "factory: L-BFGS-B by name");
     check(std::string(globopt::OptimizerFactory<double>::create("ampgo")->name()) == "AMPGO",
@@ -446,6 +511,9 @@ int main()
     testAmpgoSixHumpCamel();
     testAmpgoAnalyticGradient();
     testAmpgoParamValidation();
+    testLipoBird();
+    testLipoHolderTable();
+    testLipoRequiresBounds();
     testFloatScalar();
     testLbfgsbFloatScalar();
     testParamInterface();
