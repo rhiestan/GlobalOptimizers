@@ -7,9 +7,10 @@
 //   run_ampgo_benchmarks [seed] [optimizer]
 //
 // optimizer is "AMPGO" (default, 20000-evaluation budget, mirroring the
-// driver in go_amp.py's __main__) or "LIPO" (500-evaluation budget: MaxLIPO+TR
+// driver in go_amp.py's __main__), "LIPO" (500-evaluation budget: MaxLIPO+TR
 // targets expensive objectives and spends much more model work per
-// evaluation).
+// evaluation) or "EGO" (200-evaluation budget: Bayesian optimization spends
+// even more model work per evaluation).
 
 #include <globopt/globopt.hpp>
 #include <globopt/benchmarks/go_benchmark.hpp>
@@ -23,7 +24,9 @@ int main(int argc, char** argv)
     const unsigned long long seed = (argc > 1) ? std::stoull(argv[1]) : 12345ULL;
     const std::string optimizerName = (argc > 2) ? argv[2] : "AMPGO";
     const bool isLipo = (optimizerName == "LIPO" || optimizerName == "lipo");
-    const int budget = isLipo ? 500 : 20000;
+    const bool isEgo = (optimizerName == "EGO" || optimizerName == "ego");
+    const bool derivativeFree = isLipo || isEgo;
+    const int budget = isLipo ? 500 : (isEgo ? 200 : 20000);
 
     std::mt19937_64 rng(seed);
 
@@ -44,13 +47,19 @@ int main(int argc, char** argv)
         opt->setParam("tolerance", 1e-6);
         opt->setParam("max_function_evaluations", budget);
         opt->setParam("seed", static_cast<long long>(seed));
-        if (!isLipo) {
+        if (!derivativeFree) {
             opt->setParam("total_iterations", 2000);
         }
+        if (isEgo) {
+            // lighter multistart settings than the library defaults (10/20)
+            // to keep the 202-problem sweep tractable
+            opt->setParam("hyperparameter_starts", 4);
+            opt->setParam("acquisition_starts", 10);
+        }
 
-        // AMPGO needs gradients; LIPO is derivative-free
+        // AMPGO needs gradients; LIPO and EGO are derivative-free
         globopt::ObjectiveFunction<double> objective;
-        if (isLipo) {
+        if (derivativeFree) {
             objective = [&problem](const globopt::Vector<double>& x, globopt::Vector<double>*) {
                 return problem.objective(x);
             };

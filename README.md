@@ -49,6 +49,7 @@ Box constraints are supported through `optimizer->setBounds(lower, upper)` (use 
 | `L-BFGS-B` | local, gradient-based, box constraints | limited-memory BFGS for bound-constrained problems (Byrd, Lu, Nocedal, Zhu) with Lewis-Overton line search; ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) |
 | `AMPGO` | global | Adaptive Memory Programming for Global Optimization (Lasdon, Duarte, Glover, Laguna, Martí): local minimization alternated with tabu tunneling; ported from Andrea Gavana's Python implementation |
 | `LIPO` | global, derivative-free, requires finite bounds | MaxLIPO+TR (Malherbe & Vayatis LIPO upper bound + trust-region refinement); ported from [dlib](http://dlib.net)'s `global_function_search` |
+| `EGO` | global, derivative-free, requires finite bounds | Efficient Global Optimization (Jones, Schonlau, Welch): Bayesian optimization with a Kriging surrogate and expected-improvement infill; ported from [SMT](https://github.com/SMTorg/smt)'s `EGO` application and Kriging core |
 
 Planned: further global optimizers.
 
@@ -114,6 +115,28 @@ AMPGO needs gradients (for the local solver and the tunneling chain rule). For a
 
 LIPO is derivative-free (the objective is never asked for a gradient) and requires finite box bounds. It targets *expensive* objectives: each iteration spends considerable model-fitting work to squeeze the most out of every function evaluation, so use it with budgets of a few hundred evaluations rather than tens of thousands. Integer-variable support from the dlib original is not ported.
 
+### EGO parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_function_evaluations` | 0 | maximum number of function evaluations, DOE included (0 = max(100, 10·n)) |
+| `doe_size` | 0 | number of initial design-of-experiments samples (0 = max(5, 2·n)) |
+| `criterion` | `EI` | infill criterion: `EI` (expected improvement), `SBO` (surrogate mean) or `LCB` (mean − 3σ) |
+| `kernel` | `squar_exp` | correlation kernel: `squar_exp`, `abs_exp`, `matern32` or `matern52` |
+| `regression` | `constant` | regression (trend) model: `constant`, `linear` or `quadratic` |
+| `theta0` | 0.01 | initial correlation hyperparameter |
+| `theta_bound_lower` | 1e-6 | lower bound for the correlation hyperparameters |
+| `theta_bound_upper` | 20 | upper bound for the correlation hyperparameters |
+| `nugget` | 100·ε | jitter added to the correlation diagonal for numerical stability |
+| `noise` | 0 | fixed noise variance added to the correlation diagonal (normalized-y units) |
+| `hyperparameter_starts` | 10 | multistart points for the likelihood maximization |
+| `acquisition_starts` | 20 | multistart points for the acquisition maximization |
+| `target_objective` | -inf | value of the global optimum, if known (-inf to disable) |
+| `tolerance` | 1e-5 | stop when the best objective is within this distance of `target_objective` |
+| `seed` | 0 | random seed (0 = non-deterministic) |
+
+EGO is derivative-free and requires finite box bounds. It evaluates an initial Latin-hypercube design (the initial point passed to `run` is clamped into the box and used as the first sample), then repeatedly fits an anisotropic Kriging model — maximizing the reduced likelihood over the length-scale hyperparameters with multistart L-BFGS-B in log₁₀ space — and evaluates the point that maximizes the infill criterion. It is the strongest choice when every function evaluation is expensive: use budgets of tens to a few hundred evaluations (each iteration costs a Kriging fit, which grows cubically with the number of samples). The qEI parallel enrichment, mixed-integer support and noise estimation of the SMT original are not ported.
+
 ## Benchmarks
 
 `include/globopt/benchmarks/go_benchmark.hpp` contains all 202 problems of the `go_benchmark.py` suite accompanying AMPGO (bounds, formulas and reference optima follow the Python source exactly, quirks included — e.g. its "Easom" is Ackley-shaped, and a few `fglob` values differ from the formula's true minimum). The `run_ampgo_benchmarks` executable runs AMPGO over the full set:
@@ -122,7 +145,7 @@ LIPO is derivative-free (the objective is never asked for a gradient) and requir
 ./build/run_ampgo_benchmarks [seed]
 ```
 
-With the default seed, AMPGO solves 179 of 202 problems within a 20000-evaluation budget per problem. The misses are plateau/stair-step functions (Corana, Gear, Mishra10), noisy objectives that draw random weights on every evaluation (Stochastic, XinSheYang01), and highly oscillatory landscapes (Bukin06, Easom, Griewank, Salomon, Schaffer01/02, Ripple01, SineEnvelope, Trefethen, Wavy, Weierstrass, Pathological, CrownedCross, Deceptive, DeVilliersGlasser02, Mishra04, XinSheYang03, Zimmerman) that are hard for any gradient-based tunneling method.
+With the default seed, AMPGO solves 179 of 202 problems within a 20000-evaluation budget per problem (average ~3200 evaluations), and LIPO solves 146 of 202 within a 500-evaluation budget (median 41 evaluations on solved problems). The misses are plateau/stair-step functions (Corana, Gear, Mishra10), noisy objectives that draw random weights on every evaluation (Stochastic, XinSheYang01), and highly oscillatory landscapes (Bukin06, Easom, Griewank, Salomon, Schaffer01/02, Ripple01, SineEnvelope, Trefethen, Wavy, Weierstrass, Pathological, CrownedCross, Deceptive, DeVilliersGlasser02, Mishra04, XinSheYang03, Zimmerman) that are hard for any gradient-based tunneling method.
 
 ## Building the tests and examples
 
@@ -138,4 +161,4 @@ Eigen >= 3.4 is required (L-BFGS-B uses Eigen's indexed views). If Eigen is not 
 
 ## License
 
-MPL-2.0. The L-BFGS implementation and the Moré-Thuente line search are ported from [OptimLib](https://github.com/kthohr/optim) (Apache License 2.0, Copyright Keith O'Hara); the L-BFGS-B implementation is ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) (MIT License, Copyright Dane Roemer); AMPGO and the benchmark suite are ported from Andrea Gavana's Python implementation (go_amp.py / go_benchmark.py); attribution is retained in the corresponding headers.
+MPL-2.0. The L-BFGS implementation and the Moré-Thuente line search are ported from [OptimLib](https://github.com/kthohr/optim) (Apache License 2.0, Copyright Keith O'Hara); the L-BFGS-B implementation is ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) (MIT License, Copyright Dane Roemer); AMPGO and the benchmark suite are ported from Andrea Gavana's Python implementation (go_amp.py / go_benchmark.py); LIPO is ported from [dlib](http://dlib.net) (Boost Software License, Copyright Davis E. King); EGO and its Kriging model are ported from [SMT](https://github.com/SMTorg/smt) (New BSD License, Copyright the SMT developers); attribution is retained in the corresponding headers.

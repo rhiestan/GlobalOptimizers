@@ -414,6 +414,79 @@ void testLipoRequiresBounds()
           "lipo: non-finite bounds rejected");
 }
 
+void testEgoSphere()
+{
+    auto opt = globopt::OptimizerFactory<double>::create("EGO");
+
+    globopt::Vector<double> lb(2), ub(2);
+    lb << -2.0, -2.0;
+    ub << 3.0, 3.0;
+    opt->setBounds(lb, ub);
+    opt->setParam("target_objective", 0.0);
+    opt->setParam("tolerance", 1e-4);
+    opt->setParam("max_function_evaluations", 80);
+    opt->setParam("seed", 3);
+
+    globopt::Vector<double> x0(2);
+    x0 << 2.0, -1.5;
+    const auto res = opt->run(&sphere<double>, x0);
+
+    check(res.success(), "ego sphere: global optimum found (" + std::string(toString(res.status))
+          + ", f = " + std::to_string(res.fval) + ")");
+    check(res.functionEvaluations <= 80, "ego sphere: evaluation budget respected");
+}
+
+void testEgoBranin()
+{
+    const auto& branin = globopt::benchmarks::problem("Branin01");
+
+    auto opt = globopt::OptimizerFactory<double>::create("EGO");
+    opt->setBounds(branin.lower, branin.upper);
+    opt->setParam("target_objective", branin.fglob);
+    opt->setParam("tolerance", 1e-3);
+    opt->setParam("max_function_evaluations", 120);
+    opt->setParam("seed", 7);
+
+    auto objective = [&](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        return branin.objective(x);
+    };
+
+    std::mt19937_64 rng(7);
+    const auto res = opt->run(objective, branin.randomStart(rng));
+
+    check(res.success(), "ego branin: global optimum found (" + std::string(toString(res.status))
+          + ", f = " + std::to_string(res.fval) + ")");
+    check(res.functionEvaluations <= 120, "ego branin: evaluation budget respected");
+}
+
+void testEgoParamValidation()
+{
+    globopt::EGO<double> opt;
+
+    globopt::Vector<double> x0(2);
+    x0 << 0.0, 0.0;
+
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "ego: missing bounds rejected");
+
+    globopt::Vector<double> lb(2), ub(2);
+    lb << -1.0, -1.0;
+    ub << 1.0, std::numeric_limits<double>::infinity();
+    opt.setBounds(lb, ub);
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "ego: non-finite bounds rejected");
+
+    ub << 1.0, 1.0;
+    opt.setBounds(lb, ub);
+    opt.setParam("criterion", "nonsense");
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "ego: unknown criterion rejected");
+    opt.setParam("criterion", "EI");
+    opt.setParam("kernel", "nonsense");
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "ego: unknown kernel rejected");
+}
+
 void testUnboundedBooth()
 {
     auto opt = globopt::OptimizerFactory<double>::create("l_bfgs");
@@ -471,13 +544,15 @@ void testParamInterface()
     check(!opt->listParams().empty(), "params: listParams non-empty");
     check(std::string(opt->name()) == "L-BFGS", "optimizer: name");
 
-    check(globopt::OptimizerFactory<double>::available().size() == 4, "factory: four optimizers available");
+    check(globopt::OptimizerFactory<double>::available().size() == 5, "factory: five optimizers available");
     check(std::string(globopt::OptimizerFactory<double>::create("MaxLIPO")->name()) == "LIPO",
           "factory: LIPO by name");
     check(std::string(globopt::OptimizerFactory<double>::create("l-bfgs-b")->name()) == "L-BFGS-B",
           "factory: L-BFGS-B by name");
     check(std::string(globopt::OptimizerFactory<double>::create("ampgo")->name()) == "AMPGO",
           "factory: AMPGO by name");
+    check(std::string(globopt::OptimizerFactory<double>::create("Bayesian")->name()) == "EGO",
+          "factory: EGO by name");
 }
 
 void testInvalidInput()
@@ -514,6 +589,9 @@ int main()
     testLipoBird();
     testLipoHolderTable();
     testLipoRequiresBounds();
+    testEgoSphere();
+    testEgoBranin();
+    testEgoParamValidation();
     testFloatScalar();
     testLbfgsbFloatScalar();
     testParamInterface();
