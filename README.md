@@ -131,21 +131,43 @@ LIPO is derivative-free (the objective is never asked for a gradient) and requir
 | `noise` | 0 | fixed noise variance added to the correlation diagonal (normalized-y units) |
 | `hyperparameter_starts` | 10 | multistart points for the likelihood maximization |
 | `acquisition_starts` | 20 | multistart points for the acquisition maximization |
+| `hyperparameter_refit_interval` | 1 | re-run the likelihood maximization every k infill iterations (1 = every iteration, as in SMT) |
 | `target_objective` | -inf | value of the global optimum, if known (-inf to disable) |
 | `tolerance` | 1e-5 | stop when the best objective is within this distance of `target_objective` |
 | `seed` | 0 | random seed (0 = non-deterministic) |
 
 EGO is derivative-free and requires finite box bounds. It evaluates an initial Latin-hypercube design (the initial point passed to `run` is clamped into the box and used as the first sample), then repeatedly fits an anisotropic Kriging model — maximizing the reduced likelihood over the length-scale hyperparameters with multistart L-BFGS-B in log₁₀ space — and evaluates the point that maximizes the infill criterion. It is the strongest choice when every function evaluation is expensive: use budgets of tens to a few hundred evaluations (each iteration costs a Kriging fit, which grows cubically with the number of samples). The qEI parallel enrichment, mixed-integer support and noise estimation of the SMT original are not ported.
 
+The hyperparameter search dominates EGO's own runtime — over 95% of it on the benchmark suite, since every likelihood evaluation factorizes the correlation matrix of all samples so far. `hyperparameter_refit_interval` trades some of that away: with interval *k* the length scales are re-estimated only every *k*-th infill iteration and the surrogate is merely re-conditioned on the new sample in between, which cuts EGO's overhead almost exactly by a factor of *k*. The default 1 reproduces SMT's every-iteration behaviour; values of 5–10 are a good trade when the objective is cheap enough that EGO's own cost is what limits you.
+
 ## Benchmarks
 
-`include/globopt/benchmarks/go_benchmark.hpp` contains all 202 problems of the `go_benchmark.py` suite accompanying AMPGO (bounds, formulas and reference optima follow the Python source exactly, quirks included — e.g. its "Easom" is Ackley-shaped, and a few `fglob` values differ from the formula's true minimum). The `run_ampgo_benchmarks` executable runs AMPGO over the full set:
+`include/globopt/benchmarks/go_benchmark.hpp` contains all 202 problems of the `go_benchmark.py` suite accompanying AMPGO (bounds, formulas and reference optima follow the Python source exactly, quirks included — e.g. its "Easom" is Ackley-shaped, and a few `fglob` values differ from the formula's true minimum). Four problems (`Keane`, `CosineMixture`, `Holzman`, `SchmidtVetters`) state an `fglob` that the objective beats immediately — `Keane` is a maximization problem in the Python suite — so every optimizer scores a free "solved" on them in one to three evaluations; the counts below include those four. The `run_ampgo_benchmarks` executable runs AMPGO over the full set:
 
 ```sh
-./build/run_ampgo_benchmarks [seed]
+./build/run_ampgo_benchmarks [seed] [optimizer] [options]
 ```
 
-With the default seed, AMPGO solves 179 of 202 problems within a 20000-evaluation budget per problem (average ~3200 evaluations), and LIPO solves 146 of 202 within a 500-evaluation budget (median 41 evaluations on solved problems). The misses are plateau/stair-step functions (Corana, Gear, Mishra10), noisy objectives that draw random weights on every evaluation (Stochastic, XinSheYang01), and highly oscillatory landscapes (Bukin06, Easom, Griewank, Salomon, Schaffer01/02, Ripple01, SineEnvelope, Trefethen, Wavy, Weierstrass, Pathological, CrownedCross, Deceptive, DeVilliersGlasser02, Mishra04, XinSheYang03, Zimmerman) that are hard for any gradient-based tunneling method.
+`optimizer` is `AMPGO` (default), `LIPO` or `EGO`; each has its own default budget. The options select a subset of the suite, which keeps the expensive optimizers testable without committing to a full sweep:
+
+| Option | Description |
+|--------|-------------|
+| `--budget N` | evaluations per problem, overriding the optimizer's default |
+| `--filter SUBSTR` | only problems whose name contains `SUBSTR` (case-insensitive) |
+| `--max-dims N` | skip problems with more than `N` variables |
+| `--stride N` | take every `N`-th problem (a subset spread over the suite) |
+| `--limit N` | stop after `N` problems |
+| `--repeats N` | run each problem with `N` consecutive seeds |
+| `--refit-interval N` | EGO: re-estimate hyperparameters every `N` iterations |
+| `--list` | print the selected problems and exit |
+
+Each run reports its wall-clock time, and the summary counts both problems solved to the strict 1e-6 target and runs that land within a 1% relative gap of `fglob` — the latter matters for EGO, which is built to get close in very few evaluations rather than to converge to the last digit.
+
+```sh
+./build/run_ampgo_benchmarks 12345 EGO --stride 20   # ~11 problems, a couple of minutes
+```
+
+With the default seed, AMPGO solves 179 of 202 problems within a 20000-evaluation budget per problem (average ~3200 evaluations), and LIPO solves 146 of 202 within a 500-evaluation budget (median 41 evaluations on solved problems). EGO solves 39 of 202 within a 200-evaluation budget (median 24 evaluations on solved problems) and lands within a 1% relative gap of `fglob` on 89 of 202 — the fairer figure at a budget 2.5× smaller than LIPO's and 100× smaller than AMPGO's, since expected-improvement search closes in on the basin quickly but has no mechanism for polishing the last digits. Its successes are concentrated in low dimension (15 of 18 one-dimensional and 20 of 156 two-dimensional problems, none above four), and it is markedly seed-sensitive: over five seeds, Ackley ranges from 0.44 to 3.05. The full EGO sweep takes ~2.5 h; `--refit-interval 5` brings that down to ~35 min and, on this suite, costs nothing measurable (better on 94 problems, worse on 74 — within seed noise). The misses are plateau/stair-step functions (Corana, Gear, Mishra10), noisy objectives that draw random weights on every evaluation (Stochastic, XinSheYang01), and highly oscillatory landscapes (Bukin06, Easom, Griewank, Salomon, Schaffer01/02, Ripple01, SineEnvelope, Trefethen, Wavy, Weierstrass, Pathological, CrownedCross, Deceptive, DeVilliersGlasser02, Mishra04, XinSheYang03, Zimmerman) that are hard for any gradient-based tunneling method.
 
 ## Building the tests and examples
 
@@ -156,6 +178,8 @@ cmake -B build -S .            # finds Eigen3 >= 3.4, or falls back to ../eigen
 cmake --build build
 ctest --test-dir build
 ```
+
+Build with optimization. This code is Eigen-heavy, and an `-O0` build runs the EGO benchmark sweep roughly 37× slower than `-O3` (Eigen's assertions are active as well), which is the difference between a half-hour sweep and an overnight one. Single-config generators therefore default to `CMAKE_BUILD_TYPE=Release` here; pass `-DCMAKE_BUILD_TYPE=Debug` explicitly when you actually want to debug.
 
 Eigen >= 3.4 is required (L-BFGS-B uses Eigen's indexed views). If Eigen is not installed system-wide, point CMake at a source tree with `-DGLOBOPT_EIGEN_DIR=/path/to/eigen`.
 

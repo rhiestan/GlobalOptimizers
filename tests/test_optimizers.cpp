@@ -5,17 +5,21 @@
 #include <globopt/globopt.hpp>
 #include <globopt/benchmarks/go_benchmark.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
 int g_failures = 0;
 
-void check(bool condition, const std::string& label)
+bool check(bool condition, const std::string& label)
 {
     if (condition) {
         std::printf("[ OK ] %s\n", label.c_str());
@@ -23,6 +27,7 @@ void check(bool condition, const std::string& label)
         std::printf("[FAIL] %s\n", label.c_str());
         ++g_failures;
     }
+    return condition;
 }
 
 template <typename Scalar>
@@ -487,6 +492,486 @@ void testEgoParamValidation()
           "ego: unknown kernel rejected");
 }
 
+// A smooth 2-D test function for the surrogate tests below.
+double krigingTestFunction(const globopt::Vector<double>& x)
+{
+    return std::sin(x(0)) * std::cos(x(1)) + 0.1 * x(0) * x(0);
+}
+
+// Grid samples of krigingTestFunction over [-2, 2]^2.
+void krigingTestSamples(std::vector<globopt::Vector<double>>& xs, std::vector<double>& ys,
+                        const int perAxis = 5)
+{
+    for (int i = 0; i < perAxis; ++i) {
+        for (int j = 0; j < perAxis; ++j) {
+            globopt::Vector<double> x(2);
+            x << -2.0 + 4.0 * i / (perAxis - 1), -2.0 + 4.0 * j / (perAxis - 1);
+            xs.push_back(x);
+            ys.push_back(krigingTestFunction(x));
+        }
+    }
+}
+
+// The Kriging surrogate is an interpolator: at a training point the posterior
+// mean must reproduce the observed value and the posterior variance must
+// vanish. This exercises the ported likelihood / GLS core directly.
+void testKrigingInterpolates()
+{
+    namespace eg = globopt::detail::ego;
+
+    std::vector<globopt::Vector<double>> xs;
+    std::vector<double> ys;
+    krigingTestSamples(xs, ys);
+
+    eg::KrigingModel<double>::Options options;
+    eg::KrigingModel<double> model(options);
+    std::mt19937_64 rng(11);
+
+    check(model.fit(xs, ys, rng), "kriging: fit succeeds");
+
+    double maxError = 0.0, maxVariance = 0.0;
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+        double mean = 0.0, variance = 0.0;
+        model.predict(xs[i], &mean, &variance);
+        maxError = std::max(maxError, std::abs(mean - ys[i]));
+        maxVariance = std::max(maxVariance, variance);
+    }
+
+    check(maxError < 1e-6, "kriging: interpolates the training points (max error "
+          + std::to_string(maxError) + ")");
+    check(maxVariance < 1e-6, "kriging: vanishing variance at the training points (max "
+          + std::to_string(maxVariance) + ")");
+
+    // held-out point: the GP should generalize and report positive uncertainty
+    globopt::Vector<double> xt(2);
+    xt << 0.4, -0.7;
+    double mean = 0.0, variance = 0.0;
+    model.predict(xt, &mean, &variance);
+
+    check(std::abs(mean - krigingTestFunction(xt)) < 0.1,
+          "kriging: predicts a held-out point (error "
+          + std::to_string(std::abs(mean - krigingTestFunction(xt))) + ")");
+    check(variance > 0.0, "kriging: positive variance away from the training points");
+}
+
+// refresh() re-conditions the model on new samples with the hyperparameters of
+// the previous fit(); it must interpolate the enlarged sample set just as
+// fit() would, and must refuse to run before any fit().
+void testKrigingRefresh()
+{
+    namespace eg = globopt::detail::ego;
+
+    std::vector<globopt::Vector<double>> xs;
+    std::vector<double> ys;
+    krigingTestSamples(xs, ys);
+
+    eg::KrigingModel<double>::Options options;
+    eg::KrigingModel<double> fresh(options);
+    check(!fresh.refresh(xs, ys), "kriging: refresh before fit is rejected");
+
+    eg::KrigingModel<double> model(options);
+    std::mt19937_64 rng(11);
+    check(model.fit(xs, ys, rng), "kriging: fit before refresh succeeds");
+    const globopt::Vector<double> thetaAfterFit = model.theta();
+
+    // add samples the model has not seen and re-condition without a refit
+    for (const double offset : {0.3, -1.1, 1.7}) {
+        globopt::Vector<double> x(2);
+        x << offset, 0.5 * offset;
+        xs.push_back(x);
+        ys.push_back(krigingTestFunction(x));
+    }
+    check(model.refresh(xs, ys), "kriging: refresh on enlarged sample set succeeds");
+    check((model.theta() - thetaAfterFit).norm() == 0.0,
+          "kriging: refresh keeps the fitted hyperparameters");
+
+    double maxError = 0.0;
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+        double mean = 0.0;
+        model.predict(xs[i], &mean, nullptr);
+        maxError = std::max(maxError, std::abs(mean - ys[i]));
+    }
+    check(maxError < 1e-6, "kriging: refresh interpolates the new points too (max error "
+          + std::to_string(maxError) + ")");
+}
+
+// Every kernel and trend must produce a usable interpolating surrogate.
+void testKrigingKernelsAndRegressions()
+{
+    namespace eg = globopt::detail::ego;
+
+    std::vector<globopt::Vector<double>> xs;
+    std::vector<double> ys;
+    krigingTestSamples(xs, ys, 6);
+
+    const std::pair<eg::Kernel, const char*> kernels[] = {
+        {eg::Kernel::SquarExp, "squar_exp"},
+        {eg::Kernel::AbsExp, "abs_exp"},
+        {eg::Kernel::Matern32, "matern32"},
+        {eg::Kernel::Matern52, "matern52"},
+    };
+    const std::pair<eg::RegressionType, const char*> regressions[] = {
+        {eg::RegressionType::Constant, "constant"},
+        {eg::RegressionType::Linear, "linear"},
+        {eg::RegressionType::Quadratic, "quadratic"},
+    };
+
+    for (const auto& kernel : kernels) {
+        for (const auto& regression : regressions) {
+            eg::KrigingModel<double>::Options options;
+            options.kernel = kernel.first;
+            options.regression = regression.first;
+            eg::KrigingModel<double> model(options);
+            std::mt19937_64 rng(5);
+
+            const std::string label =
+                std::string(kernel.second) + " / " + regression.second;
+            if (!check(model.fit(xs, ys, rng), "kriging (" + label + "): fit succeeds")) {
+                continue;
+            }
+
+            double maxError = 0.0;
+            for (std::size_t i = 0; i < xs.size(); ++i) {
+                double mean = 0.0;
+                model.predict(xs[i], &mean, nullptr);
+                maxError = std::max(maxError, std::abs(mean - ys[i]));
+            }
+            check(maxError < 1e-5, "kriging (" + label + "): interpolates (max error "
+                  + std::to_string(maxError) + ")");
+        }
+    }
+}
+
+// Independent check of the ported Kriging algebra: the model computes its
+// posterior through a Cholesky factorization of R and a QR of C^-1 F, which is
+// numerically convenient but hard to eyeball. Here the same posterior is
+// recomputed from the textbook universal-kriging formulas with a dense solve
+// and a hand-written squar_exp kernel, so a mistake in the standardization,
+// the GLS trend or the variance formula would show up as a mismatch.
+void testKrigingAgainstReferenceFormulas()
+{
+    namespace eg = globopt::detail::ego;
+    using Matrix = globopt::Matrix<double>;
+    using Vector = globopt::Vector<double>;
+
+    std::vector<Vector> xs;
+    std::vector<double> ys;
+    krigingTestSamples(xs, ys, 3);
+    const globopt::Index nt = static_cast<globopt::Index>(xs.size());
+
+    eg::KrigingModel<double>::Options options; // squar_exp / constant trend
+    eg::KrigingModel<double> model(options);
+    std::mt19937_64 rng(9);
+    if (!check(model.fit(xs, ys, rng), "kriging reference: fit succeeds")) {
+        return;
+    }
+    const Vector theta = model.theta(); // compare at the hyperparameters it chose
+
+    // -- standardization, as SMT does it (population standard deviation) -----
+    Matrix X(nt, 2);
+    Vector y(nt);
+    for (globopt::Index i = 0; i < nt; ++i) {
+        X.row(i) = xs[static_cast<std::size_t>(i)].transpose();
+        y(i) = ys[static_cast<std::size_t>(i)];
+    }
+    const Vector xOffset = X.colwise().mean();
+    const Vector xScale =
+        (X.rowwise() - xOffset.transpose()).array().square().colwise().mean().sqrt();
+    const double yMean = y.mean();
+    const double yStd = std::sqrt((y.array() - yMean).square().mean());
+
+    const Matrix Xn =
+        (X.rowwise() - xOffset.transpose()).array().rowwise() / xScale.transpose().array();
+    const Vector yn = (y.array() - yMean) / yStd;
+
+    // -- correlation matrix, hand-written squar_exp --------------------------
+    auto correlation = [&theta](const Vector& a, const Vector& b) {
+        double s = 0.0;
+        for (globopt::Index k = 0; k < a.size(); ++k) {
+            s += theta(k) * (a(k) - b(k)) * (a(k) - b(k));
+        }
+        return std::exp(-s);
+    };
+
+    Matrix R(nt, nt);
+    for (globopt::Index i = 0; i < nt; ++i) {
+        for (globopt::Index j = 0; j < nt; ++j) {
+            R(i, j) = (i == j) ? 1.0 + options.nugget + options.noise
+                               : correlation(Xn.row(i).transpose(), Xn.row(j).transpose());
+        }
+    }
+
+    // -- generalized least squares trend and the kriging weights -------------
+    const Matrix F = Matrix::Ones(nt, 1);
+    const Matrix Rinv = R.inverse();
+    const Matrix FtRinvF = F.transpose() * Rinv * F;
+    const Vector beta = FtRinvF.inverse() * (F.transpose() * Rinv * yn);
+    const Vector residual = yn - F * beta;
+    const Vector gamma = Rinv * residual;
+    const double sigma2 = residual.dot(Rinv * residual) / static_cast<double>(nt);
+
+    double maxMeanError = 0.0, maxVarianceError = 0.0;
+    for (const double a : {-1.7, -0.6, 0.0, 0.8, 1.9}) {
+        for (const double b : {-1.3, 0.4, 1.5}) {
+            Vector x(2);
+            x << a, b;
+            const Vector xn = (x - xOffset).cwiseQuotient(xScale);
+
+            Vector r(nt);
+            for (globopt::Index i = 0; i < nt; ++i) {
+                r(i) = correlation(Xn.row(i).transpose(), xn);
+            }
+
+            const double referenceMean = yMean + yStd * (beta(0) + r.dot(gamma));
+            const Vector u = F.transpose() * Rinv * r - Vector::Ones(1);
+            const double referenceVariance =
+                sigma2 * (1.0 - r.dot(Rinv * r) + u.dot(FtRinvF.inverse() * u)) * yStd * yStd;
+
+            double mean = 0.0, variance = 0.0;
+            model.predict(x, &mean, &variance);
+
+            maxMeanError = std::max(maxMeanError, std::abs(mean - referenceMean));
+            maxVarianceError =
+                std::max(maxVarianceError, std::abs(variance - std::max(0.0, referenceVariance)));
+        }
+    }
+
+    check(maxMeanError < 1e-8, "kriging reference: posterior mean matches the GLS formula "
+          "(max error " + std::to_string(maxMeanError) + ")");
+    check(maxVarianceError < 1e-8, "kriging reference: posterior variance matches the "
+          "universal-kriging formula (max error " + std::to_string(maxVarianceError) + ")");
+}
+
+// A non-zero noise term turns the interpolator into a regressor: the posterior
+// no longer has to pass exactly through the observations.
+void testKrigingNoise()
+{
+    namespace eg = globopt::detail::ego;
+
+    std::vector<globopt::Vector<double>> xs;
+    std::vector<double> ys;
+    krigingTestSamples(xs, ys, 4);
+
+    eg::KrigingModel<double>::Options options;
+    options.noise = 1e-2;
+    eg::KrigingModel<double> model(options);
+    std::mt19937_64 rng(13);
+    check(model.fit(xs, ys, rng), "kriging noise: fit succeeds");
+
+    double maxError = 0.0, maxVariance = 0.0;
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+        double mean = 0.0, variance = 0.0;
+        model.predict(xs[i], &mean, &variance);
+        maxError = std::max(maxError, std::abs(mean - ys[i]));
+        maxVariance = std::max(maxVariance, variance);
+    }
+
+    check(maxError > 1e-6, "kriging noise: smooths rather than interpolates (max deviation "
+          + std::to_string(maxError) + ")");
+    check(maxError < 0.5, "kriging noise: still follows the data");
+    check(maxVariance > 0.0, "kriging noise: keeps positive variance at the samples");
+}
+
+// Expected improvement is non-negative everywhere, vanishes at an already
+// sampled point (no uncertainty, no improvement) and is positive in an
+// unexplored region.
+void testExpectedImprovement()
+{
+    namespace eg = globopt::detail::ego;
+
+    // A coarse design on purpose: on a dense grid this smooth function is
+    // fitted so well that the posterior is numerically certain everywhere and
+    // the expected improvement vanishes over the whole box.
+    std::vector<globopt::Vector<double>> xs;
+    std::vector<double> ys;
+    krigingTestSamples(xs, ys, 3);
+
+    eg::KrigingModel<double>::Options options;
+    eg::KrigingModel<double> model(options);
+    std::mt19937_64 rng(3);
+    check(model.fit(xs, ys, rng), "ei: surrogate fit succeeds");
+
+    const double fmin = *std::min_element(ys.begin(), ys.end());
+
+    bool allNonNegative = true;
+    for (double x0 = -2.0; x0 <= 2.0; x0 += 0.25) {
+        for (double x1 = -2.0; x1 <= 2.0; x1 += 0.25) {
+            globopt::Vector<double> x(2);
+            x << x0, x1;
+            if (eg::expectedImprovement(model, fmin, x) < 0.0) {
+                allNonNegative = false;
+            }
+        }
+    }
+    check(allNonNegative, "ei: non-negative over the domain");
+
+    // a point between grid samples is uncertain, so improvement is possible
+    globopt::Vector<double> gap(2);
+    gap << -1.0, -1.0;
+    const double gapEi = eg::expectedImprovement(model, fmin, gap);
+    check(gapEi > 0.0, "ei: positive in an unexplored region");
+
+    // At an already sampled point the posterior is (numerically) certain, so
+    // the expected improvement collapses: not exactly zero in floating point,
+    // but negligible next to an unexplored point.
+    double maxTrainingEi = 0.0;
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+        maxTrainingEi = std::max(maxTrainingEi, eg::expectedImprovement(model, fmin, xs[i]));
+    }
+    check(maxTrainingEi < 1e-3 * gapEi,
+          "ei: negligible at the training points (" + std::to_string(maxTrainingEi)
+          + " vs " + std::to_string(gapEi) + " unexplored)");
+}
+
+// EGO must accept every documented kernel, trend and infill criterion and make
+// real progress on a simple bowl with each of them.
+void testEgoOptions()
+{
+    globopt::Vector<double> lb(2), ub(2);
+    lb << -2.0, -2.0;
+    ub << 3.0, 3.0;
+    globopt::Vector<double> x0(2);
+    x0 << 2.0, -1.5;
+    const double startValue = x0.squaredNorm();
+
+    auto runWith = [&](const char* param, const char* value, const int doeSize) {
+        auto opt = globopt::OptimizerFactory<double>::create("EGO");
+        opt->setBounds(lb, ub);
+        opt->setParam("max_function_evaluations", 40);
+        opt->setParam("seed", 17);
+        opt->setParam(param, value);
+        if (doeSize > 0) {
+            opt->setParam("doe_size", doeSize);
+        }
+        const auto res = opt->run(&sphere<double>, x0);
+
+        const std::string label =
+            std::string("ego (") + param + " = " + value + ")";
+        check(res.status != globopt::Status::InvalidInput, label + ": accepted");
+        check(res.fval < 0.1 * startValue, label + ": improves on the start point (f = "
+              + std::to_string(res.fval) + ")");
+        check((res.x.array() >= lb.array()).all() && (res.x.array() <= ub.array()).all(),
+              label + ": stays inside the box");
+        check(res.functionEvaluations <= 40, label + ": budget respected");
+    };
+
+    for (const char* kernel : {"squar_exp", "abs_exp", "matern32", "matern52"}) {
+        runWith("kernel", kernel, 0);
+    }
+    for (const char* criterion : {"EI", "SBO", "LCB"}) {
+        runWith("criterion", criterion, 0);
+    }
+    // linear and quadratic trends need more DOE points than trend coefficients
+    for (const char* regression : {"constant", "linear", "quadratic"}) {
+        runWith("regression", regression, 12);
+    }
+}
+
+// The evaluation budget, the DOE size and the reported result must be
+// consistent: this is what makes benchmark numbers trustworthy.
+void testEgoBudgetAndResult()
+{
+    globopt::Vector<double> lb(2), ub(2);
+    lb << -2.0, -2.0;
+    ub << 3.0, 3.0;
+    globopt::Vector<double> x0(2);
+    x0 << 2.0, -1.5;
+
+    std::size_t observed = 0;
+    auto counted = [&](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        ++observed;
+        return x.squaredNorm();
+    };
+
+    auto opt = globopt::OptimizerFactory<double>::create("EGO");
+    opt->setBounds(lb, ub);
+    opt->setParam("max_function_evaluations", 30);
+    opt->setParam("doe_size", 8);
+    opt->setParam("seed", 23);
+    const auto res = opt->run(counted, x0);
+
+    check(res.status == globopt::Status::MaxFunctionEvaluationsReached,
+          "ego budget: spends the whole budget without a target");
+    check(res.functionEvaluations == 30, "ego budget: exactly the requested evaluations ("
+          + std::to_string(res.functionEvaluations) + ")");
+    check(observed == res.functionEvaluations,
+          "ego budget: reported evaluations match actual objective calls");
+    check(res.iterations == 30 - 8, "ego budget: DOE size honoured ("
+          + std::to_string(res.iterations) + " infill iterations)");
+    check(std::abs(res.fval - res.x.squaredNorm()) < 1e-12,
+          "ego budget: reported fval matches the reported x");
+    check(res.message.find("8 DOE") != std::string::npos,
+          "ego budget: message reports the DOE split (" + res.message + ")");
+}
+
+// A fixed seed must give a reproducible run - benchmark sweeps depend on it.
+void testEgoDeterminism()
+{
+    globopt::Vector<double> lb(2), ub(2);
+    lb << -2.0, -2.0;
+    ub << 3.0, 3.0;
+    globopt::Vector<double> x0(2);
+    x0 << 2.0, -1.5;
+
+    auto runSeeded = [&](const long long seed) {
+        auto opt = globopt::OptimizerFactory<double>::create("EGO");
+        opt->setBounds(lb, ub);
+        opt->setParam("max_function_evaluations", 30);
+        opt->setParam("seed", seed);
+        return opt->run(&sphere<double>, x0);
+    };
+
+    const auto first = runSeeded(31);
+    const auto again = runSeeded(31);
+    const auto other = runSeeded(32);
+
+    check(first.fval == again.fval && (first.x - again.x).norm() == 0.0,
+          "ego determinism: same seed reproduces the run exactly");
+    check(other.fval != first.fval,
+          "ego determinism: a different seed explores differently");
+}
+
+// hyperparameter_refit_interval trades hyperparameter re-estimation for speed.
+// Interval 1 must reproduce the every-iteration behaviour exactly, and a larger
+// interval must still optimize while doing measurably less work.
+void testEgoRefitInterval()
+{
+    globopt::Vector<double> lb(2), ub(2);
+    lb << -2.0, -2.0;
+    ub << 3.0, 3.0;
+    globopt::Vector<double> x0(2);
+    x0 << 2.0, -1.5;
+
+    auto runWithInterval = [&](const long long interval, double& seconds) {
+        auto opt = globopt::OptimizerFactory<double>::create("EGO");
+        opt->setBounds(lb, ub);
+        opt->setParam("max_function_evaluations", 60);
+        opt->setParam("seed", 41);
+        if (interval > 0) {
+            opt->setParam("hyperparameter_refit_interval", interval);
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const auto res = opt->run(&sphere<double>, x0);
+        seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return res;
+    };
+
+    double defaultSeconds = 0.0, oneSeconds = 0.0, tenSeconds = 0.0;
+    const auto byDefault = runWithInterval(0, defaultSeconds);
+    const auto interval1 = runWithInterval(1, oneSeconds);
+    const auto interval10 = runWithInterval(10, tenSeconds);
+
+    check(byDefault.fval == interval1.fval && (byDefault.x - interval1.x).norm() == 0.0,
+          "ego refit interval: 1 is the default and refits every iteration");
+    check(interval10.functionEvaluations == interval1.functionEvaluations,
+          "ego refit interval: budget unaffected");
+    check(interval10.fval < 1e-2, "ego refit interval: 10 still optimizes (f = "
+          + std::to_string(interval10.fval) + ")");
+    check(tenSeconds < oneSeconds,
+          "ego refit interval: 10 is cheaper than 1 (" + std::to_string(tenSeconds)
+          + " s vs " + std::to_string(oneSeconds) + " s)");
+}
+
 void testUnboundedBooth()
 {
     auto opt = globopt::OptimizerFactory<double>::create("l_bfgs");
@@ -592,6 +1077,16 @@ int main()
     testEgoSphere();
     testEgoBranin();
     testEgoParamValidation();
+    testKrigingInterpolates();
+    testKrigingRefresh();
+    testKrigingKernelsAndRegressions();
+    testKrigingAgainstReferenceFormulas();
+    testKrigingNoise();
+    testExpectedImprovement();
+    testEgoOptions();
+    testEgoBudgetAndResult();
+    testEgoDeterminism();
+    testEgoRefitInterval();
     testFloatScalar();
     testLbfgsbFloatScalar();
     testParamInterface();

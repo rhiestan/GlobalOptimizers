@@ -24,6 +24,10 @@
 //     initial point passed to run() is included as the first DOE sample.
 //   - The previous iteration's optimal theta is added to the hyperparameter
 //     multistart set (warm start).
+//   - The hyperparameters can optionally be re-estimated only every k infill
+//     iterations ("hyperparameter_refit_interval", 1 = SMT's every-iteration
+//     behaviour); in between, the surrogate is re-conditioned on the new
+//     samples with the previous hyperparameters.
 //   - Continuous variables only; the qEI parallel enrichment, EI tunneling,
 //     noise estimation (eval_noise) and reinterpolation paths are not ported.
 //     A fixed noise term on the correlation diagonal is available instead.
@@ -134,15 +138,23 @@ inline Vector<Scalar> regressionRow(const RegressionType type, const Vector<Scal
 
 /// Correlations for a batch of point pairs. absDx holds one componentwise
 /// absolute distance |x - x'| (in normalized coordinates) per column; the
-/// result has one correlation value per column.
+/// result has one correlation value per column. absDxSq, when non-null, is the
+/// componentwise square of absDx, cached by the caller because the squar_exp
+/// kernel is evaluated many times over the same distances.
 template <typename Scalar, typename Derived>
 inline Vector<Scalar> correlationVector(const Kernel kernel, const Vector<Scalar>& theta,
-                                        const Eigen::MatrixBase<Derived>& absDx)
+                                        const Eigen::MatrixBase<Derived>& absDx,
+                                        const Matrix<Scalar>* absDxSq = nullptr)
 {
     using ArrayXX = Eigen::Array<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
     switch (kernel) {
         case Kernel::SquarExp: {
-            const Vector<Scalar> s = absDx.cwiseProduct(absDx).transpose() * theta;
+            Vector<Scalar> s;
+            if (absDxSq != nullptr) {
+                s.noalias() = absDxSq->transpose() * theta;
+            } else {
+                s.noalias() = absDx.cwiseProduct(absDx).transpose() * theta;
+            }
             return (-s.array()).exp();
         }
         case Kernel::AbsExp: {
@@ -190,66 +202,15 @@ public:
 
     const Vector<Scalar>& theta() const { return m_theta; }
 
-    /// Train on the given samples. Returns false if the model cannot be fit
+    /// Train on the given samples: standardize, then search for the maximum
+    /// likelihood hyperparameters. Returns false if the model cannot be fit
     /// (too few points or no feasible hyperparameters found).
     bool fit(const std::vector<Vector<Scalar>>& xs, const std::vector<Scalar>& ys, std::mt19937_64& rng)
     {
-        const Index nt = static_cast<Index>(xs.size());
-        if (nt < 2) {
+        if (!prepare(xs, ys)) {
             return false;
         }
-        const Index dims = xs[0].size();
-        const Index p = regressionSize(m_options.regression, dims);
-        if (nt <= p) {
-            return false;
-        }
-
-        // -- standardization (SMT utils standardization: population std) ----
-        Matrix<Scalar> X(nt, dims);
-        Vector<Scalar> y(nt);
-        for (Index i = 0; i < nt; ++i) {
-            X.row(i) = xs[static_cast<std::size_t>(i)].transpose();
-            y(i) = ys[static_cast<std::size_t>(i)];
-        }
-
-        m_xOffset = X.colwise().mean();
-        Vector<Scalar> xVar = (X.rowwise() - m_xOffset.transpose()).array().square().colwise().mean();
-        m_xScale = xVar.array().sqrt();
-        for (Index k = 0; k < dims; ++k) {
-            if (m_xScale(k) <= Scalar(0)) {
-                m_xScale(k) = Scalar(1);
-            }
-        }
-        m_yMean = y.mean();
-        m_yStd = std::sqrt((y.array() - m_yMean).square().mean());
-        if (m_yStd <= Scalar(0)) {
-            m_yStd = Scalar(1);
-        }
-
-        m_X = (X.rowwise() - m_xOffset.transpose()).array().rowwise() / m_xScale.transpose().array();
-        m_y = (y.array() - m_yMean) / m_yStd;
-
-        // -- componentwise cross distances |x_i - x_j| (i < j) ---------------
-        const Index numPairs = nt * (nt - 1) / 2;
-        m_pairI.resize(static_cast<std::size_t>(numPairs));
-        m_pairJ.resize(static_cast<std::size_t>(numPairs));
-        m_absDx.resize(dims, numPairs);
-        {
-            Index k = 0;
-            for (Index i = 0; i < nt; ++i) {
-                for (Index j = i + 1; j < nt; ++j, ++k) {
-                    m_pairI[static_cast<std::size_t>(k)] = i;
-                    m_pairJ[static_cast<std::size_t>(k)] = j;
-                    m_absDx.col(k) = (m_X.row(i) - m_X.row(j)).cwiseAbs().transpose();
-                }
-            }
-        }
-
-        // -- regression matrix F ---------------------------------------------
-        m_F.resize(nt, p);
-        for (Index i = 0; i < nt; ++i) {
-            m_F.row(i) = regressionRow<Scalar>(m_options.regression, m_X.row(i).transpose()).transpose();
-        }
+        const Index dims = m_X.cols();
 
         // -- multistart likelihood maximization in log10(theta) --------------
         const Scalar lo = std::log10(m_options.thetaLower);
@@ -309,6 +270,20 @@ public:
         return std::isfinite(reducedLikelihood(m_theta, &m_pars));
     }
 
+    /// Re-condition the model on new samples while keeping the hyperparameters
+    /// found by the last fit(): a single likelihood evaluation instead of a
+    /// multistart search. Returns false if no hyperparameters are available yet
+    /// (fit() must succeed once first) or if they are infeasible for the new
+    /// data, in which case the caller should fall back to fit().
+    bool refresh(const std::vector<Vector<Scalar>>& xs, const std::vector<Scalar>& ys)
+    {
+        const Vector<Scalar> theta = m_theta; // prepare() leaves theta alone
+        if (theta.size() == 0 || !prepare(xs, ys) || theta.size() != m_X.cols()) {
+            return false;
+        }
+        return std::isfinite(reducedLikelihood(theta, &m_pars));
+    }
+
     /// Posterior mean and variance at x (original, un-normalized units).
     void predict(const Vector<Scalar>& x, Scalar* mean, Scalar* variance) const
     {
@@ -333,6 +308,71 @@ public:
     }
 
 private:
+    /// Standardize the samples and build the cross-distance and regression
+    /// matrices that every likelihood evaluation reuses. Leaves the
+    /// hyperparameters untouched. Returns false if there are too few points.
+    bool prepare(const std::vector<Vector<Scalar>>& xs, const std::vector<Scalar>& ys)
+    {
+        const Index nt = static_cast<Index>(xs.size());
+        if (nt < 2) {
+            return false;
+        }
+        const Index dims = xs[0].size();
+        const Index p = regressionSize(m_options.regression, dims);
+        if (nt <= p) {
+            return false;
+        }
+
+        // -- standardization (SMT utils standardization: population std) ----
+        Matrix<Scalar> X(nt, dims);
+        Vector<Scalar> y(nt);
+        for (Index i = 0; i < nt; ++i) {
+            X.row(i) = xs[static_cast<std::size_t>(i)].transpose();
+            y(i) = ys[static_cast<std::size_t>(i)];
+        }
+
+        m_xOffset = X.colwise().mean();
+        Vector<Scalar> xVar = (X.rowwise() - m_xOffset.transpose()).array().square().colwise().mean();
+        m_xScale = xVar.array().sqrt();
+        for (Index k = 0; k < dims; ++k) {
+            if (m_xScale(k) <= Scalar(0)) {
+                m_xScale(k) = Scalar(1);
+            }
+        }
+        m_yMean = y.mean();
+        m_yStd = std::sqrt((y.array() - m_yMean).square().mean());
+        if (m_yStd <= Scalar(0)) {
+            m_yStd = Scalar(1);
+        }
+
+        m_X = (X.rowwise() - m_xOffset.transpose()).array().rowwise() / m_xScale.transpose().array();
+        m_y = (y.array() - m_yMean) / m_yStd;
+
+        // -- componentwise cross distances |x_i - x_j| (i < j) ---------------
+        const Index numPairs = nt * (nt - 1) / 2;
+        m_pairI.resize(static_cast<std::size_t>(numPairs));
+        m_pairJ.resize(static_cast<std::size_t>(numPairs));
+        m_absDx.resize(dims, numPairs);
+        {
+            Index k = 0;
+            for (Index i = 0; i < nt; ++i) {
+                for (Index j = i + 1; j < nt; ++j, ++k) {
+                    m_pairI[static_cast<std::size_t>(k)] = i;
+                    m_pairJ[static_cast<std::size_t>(k)] = j;
+                    m_absDx.col(k) = (m_X.row(i) - m_X.row(j)).cwiseAbs().transpose();
+                }
+            }
+        }
+        m_absDxSq = m_absDx.cwiseProduct(m_absDx);
+
+        // -- regression matrix F ---------------------------------------------
+        m_F.resize(nt, p);
+        for (Index i = 0; i < nt; ++i) {
+            m_F.row(i) = regressionRow<Scalar>(m_options.regression, m_X.row(i).transpose()).transpose();
+        }
+        return true;
+    }
+
     struct Pars {
         Matrix<Scalar> L;  // Cholesky factor of R
         Matrix<Scalar> Ft; // C^-1 F
@@ -353,7 +393,8 @@ private:
         Matrix<Scalar> R = Matrix<Scalar>::Identity(nt, nt)
             * (Scalar(1) + m_options.nugget + m_options.noise);
         const Index numPairs = m_absDx.cols();
-        const Vector<Scalar> corr = correlationVector(m_options.kernel, theta, m_absDx);
+        const Vector<Scalar> corr =
+            correlationVector(m_options.kernel, theta, m_absDx, &m_absDxSq);
         for (Index k = 0; k < numPairs; ++k) {
             R(m_pairI[static_cast<std::size_t>(k)], m_pairJ[static_cast<std::size_t>(k)]) = corr(k);
             R(m_pairJ[static_cast<std::size_t>(k)], m_pairI[static_cast<std::size_t>(k)]) = corr(k);
@@ -408,7 +449,8 @@ private:
     Vector<Scalar> m_xOffset, m_xScale;
     Scalar m_yMean = Scalar(0), m_yStd = Scalar(1);
 
-    Matrix<Scalar> m_absDx; // componentwise |dx| per pair (dims x numPairs)
+    Matrix<Scalar> m_absDx;   // componentwise |dx| per pair (dims x numPairs)
+    Matrix<Scalar> m_absDxSq; // its componentwise square, cached for squar_exp
     std::vector<Index> m_pairI, m_pairJ;
     Matrix<Scalar> m_F;
 
@@ -479,6 +521,10 @@ public:
                             "number of multistart points for the likelihood maximization");
         this->registerParam("acquisition_starts", &m_acquisitionStarts,
                             "number of multistart points for the acquisition maximization");
+        this->registerParam("hyperparameter_refit_interval", &m_hyperparameterRefitInterval,
+                            "re-run the likelihood maximization every k infill iterations; in "
+                            "between, the surrogate is re-conditioned on the new samples with the "
+                            "previous hyperparameters (1 = refit every iteration, as in SMT)");
         this->registerParam("target_objective", &m_targetObjective,
                             "value of the global optimum, if known (-inf to disable)");
         this->registerParam("tolerance", &m_tolerance,
@@ -621,9 +667,30 @@ protected:
         modelOptions.multistarts = m_hyperparameterStarts;
         eg::KrigingModel<Scalar> model(modelOptions);
 
+        // A full fit() is a multistart likelihood maximization and dominates the
+        // cost of an infill iteration; with a refit interval > 1 the
+        // hyperparameters are only re-estimated every k iterations and the
+        // cheap refresh() re-conditions the surrogate on the new sample in
+        // between.
+        const std::size_t refitInterval = std::max<std::size_t>(1, m_hyperparameterRefitInterval);
+        std::size_t sinceRefit = 0;
+        bool haveFit = false;
+
         while (!reachedTarget() && evaluations < budget) {
+            const bool refit = !haveFit || sinceRefit >= refitInterval - 1;
+            bool ready = false;
+            if (!refit) {
+                ready = model.refresh(xs, ys);
+                ++sinceRefit;
+            }
+            if (!ready) {
+                ready = model.fit(xs, ys, rng);
+                haveFit = ready;
+                sinceRefit = 0;
+            }
+
             Vector<Scalar> xNext;
-            if (model.fit(xs, ys, rng)) {
+            if (ready) {
                 xNext = nextInfillPoint(model, criterion, bestY, rng);
             }
             if (xNext.size() != dims || !xNext.allFinite() || tooClose(xNext, xs)) {
@@ -727,6 +794,7 @@ private:
     Scalar m_noise = Scalar(0);
     std::size_t m_hyperparameterStarts = 10;
     std::size_t m_acquisitionStarts = 20;
+    std::size_t m_hyperparameterRefitInterval = 1;
     Scalar m_targetObjective = -detail::inf<Scalar>();
     Scalar m_tolerance = Scalar(1e-05);
     long long m_seed = 0;

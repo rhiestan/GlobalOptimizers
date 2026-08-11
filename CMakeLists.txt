@@ -5,6 +5,18 @@ project(GlobalOptimizers
     DESCRIPTION "Header-only library of global and local optimizers based on Eigen"
     LANGUAGES CXX)
 
+# -- build type ---------------------------------------------------------------
+
+# These optimizers are Eigen-heavy and unusably slow without optimization: an
+# -O0 build of the EGO benchmark sweep is tens of times slower than -O3 (and
+# Eigen's assertions are active). Default single-config generators to Release
+# rather than to the empty (no optimization) build type.
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+        Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 # -- Eigen --------------------------------------------------------------------
 
 # L-BFGS-B uses Eigen's indexed views, which need Eigen >= 3.4
@@ -67,4 +79,12 @@ if (GLOBOPT_BUILD_TESTS)
     if (MSVC)
         target_compile_options(run_ampgo_benchmarks PRIVATE /bigobj)
     endif()
+
+    # Smoke-test the benchmark driver on a small slice of the suite: enough to
+    # catch a broken optimizer or driver, fast enough to run with the unit
+    # tests. Full sweeps are run by hand (see the README).
+    add_test(NAME benchmark_subset_ego
+        COMMAND run_ampgo_benchmarks 12345 EGO --stride 40 --budget 60 --refit-interval 5)
+    add_test(NAME benchmark_subset_lipo
+        COMMAND run_ampgo_benchmarks 12345 LIPO --stride 40 --budget 200)
 endif()
