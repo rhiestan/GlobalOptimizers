@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <globopt/globopt.hpp>
+#include <globopt/benchmarks/directgo_benchmark.hpp>
 #include <globopt/benchmarks/go_benchmark.hpp>
 
 #include <algorithm>
@@ -972,6 +973,229 @@ void testEgoRefitInterval()
           + " s vs " + std::to_string(oneSeconds) + " s)");
 }
 
+// -- CMA-ES ------------------------------------------------------------------
+
+// An ill-conditioned, non-separable quadratic is the discriminating test for
+// covariance adaptation: a method that cannot learn the metric stalls here.
+template <typename Scalar>
+Scalar ellipsoid(const globopt::Vector<Scalar>& x, globopt::Vector<Scalar>* grad)
+{
+    const globopt::Index n = x.size();
+    Scalar value = 0;
+    globopt::Vector<Scalar> weights(n);
+    for (globopt::Index i = 0; i < n; ++i) {
+        weights(i) = std::pow(Scalar(1e6), Scalar(i) / Scalar(n > 1 ? n - 1 : 1));
+        value += weights(i) * x(i) * x(i);
+    }
+    if (grad) {
+        *grad = 2 * weights.cwiseProduct(x);
+    }
+    return value;
+}
+
+template <typename Scalar>
+Scalar rastrigin(const globopt::Vector<Scalar>& x, globopt::Vector<Scalar>*)
+{
+    const Scalar twoPi = Scalar(2) * Scalar(3.14159265358979323846);
+    return Scalar(10) * Scalar(x.size())
+        + (x.array().square() - Scalar(10) * (twoPi * x.array()).cos()).sum();
+}
+
+void testCmaesUnimodal()
+{
+    const globopt::Index n = 10;
+    globopt::Vector<double> lb = globopt::Vector<double>::Constant(n, -5.0);
+    globopt::Vector<double> ub = globopt::Vector<double>::Constant(n, 5.0);
+    globopt::Vector<double> x0 = globopt::Vector<double>::Constant(n, 3.0);
+
+    auto solve = [&](globopt::ObjectiveFunction<double> f, const char* label) {
+        auto opt = globopt::OptimizerFactory<double>::create("CMA-ES");
+        opt->setBounds(lb, ub);
+        opt->setParam("max_function_evaluations", 50000);
+        opt->setParam("target_objective", 0.0);
+        opt->setParam("tolerance", 1e-8);
+        opt->setParam("seed", 5);
+        const auto res = opt->run(f, x0);
+        check(res.success(), std::string("cmaes ") + label + ": reaches the optimum ("
+              + std::string(toString(res.status)) + ", f = " + std::to_string(res.fval) + ")");
+        check((res.x.array() >= lb.array()).all() && (res.x.array() <= ub.array()).all(),
+              std::string("cmaes ") + label + ": stays inside the box");
+        return res;
+    };
+
+    solve(&sphere<double>, "sphere(10)");
+    // condition number 1e6: only works if the covariance matrix really adapts
+    solve(&ellipsoid<double>, "ellipsoid(10, cond 1e6)");
+    solve(&rosenbrockN<double>, "rosenbrock(10)");
+}
+
+// IPOP restarts are what turn CMA-ES from a local into a global search, so a
+// multimodal landscape must actually trigger them.
+void testCmaesRestarts()
+{
+    const globopt::Index n = 5;
+    auto opt = globopt::OptimizerFactory<double>::create("CMA-ES");
+    opt->setBounds(globopt::Vector<double>::Constant(n, -5.12),
+                   globopt::Vector<double>::Constant(n, 5.12));
+    opt->setParam("max_function_evaluations", 100000);
+    opt->setParam("target_objective", 0.0);
+    opt->setParam("tolerance", 1e-6);
+    opt->setParam("seed", 11);
+
+    const auto res = opt->run(&rastrigin<double>, globopt::Vector<double>::Constant(n, 4.0));
+
+    check(res.success(), "cmaes rastrigin(5): reaches the global optimum (f = "
+          + std::to_string(res.fval) + ")");
+    check(res.message.find("restarts") != std::string::npos,
+          "cmaes: reports the restart count (" + res.message + ")");
+
+    // with restarts disabled the same budget converges into some basin, but the
+    // run must still be well-formed and honour the budget
+    auto single = globopt::OptimizerFactory<double>::create("CMA-ES");
+    single->setBounds(globopt::Vector<double>::Constant(n, -5.12),
+                      globopt::Vector<double>::Constant(n, 5.12));
+    single->setParam("max_function_evaluations", 100000);
+    single->setParam("max_restarts", 0);
+    single->setParam("seed", 11);
+    const auto res0 = single->run(&rastrigin<double>, globopt::Vector<double>::Constant(n, 4.0));
+    check(res0.functionEvaluations <= 100000, "cmaes: budget respected without restarts");
+    check(res0.status == globopt::Status::Stalled,
+          "cmaes: a single converged run without a target reports Stalled ("
+          + std::string(toString(res0.status)) + ")");
+}
+
+// CMA-ES is the only global optimizer here that does not need bounds.
+void testCmaesUnbounded()
+{
+    auto opt = globopt::OptimizerFactory<double>::create("CMA-ES");
+    opt->setParam("max_function_evaluations", 20000);
+    opt->setParam("target_objective", 0.0);
+    opt->setParam("tolerance", 1e-8);
+    opt->setParam("seed", 7);
+
+    globopt::Vector<double> x0(4);
+    x0 << 3.0, -2.0, 5.0, 1.0;
+    const auto res = opt->run(&sphere<double>, x0);
+
+    check(res.success(), "cmaes unbounded: converges without bounds (f = "
+          + std::to_string(res.fval) + ")");
+    check(res.x.norm() < 1e-3, "cmaes unbounded: solution near the origin");
+}
+
+void testCmaesResultConsistency()
+{
+    const globopt::Index n = 4;
+    globopt::Vector<double> lb = globopt::Vector<double>::Constant(n, -3.0);
+    globopt::Vector<double> ub = globopt::Vector<double>::Constant(n, 3.0);
+
+    std::size_t observed = 0;
+    auto counted = [&](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        ++observed;
+        return x.squaredNorm();
+    };
+
+    auto opt = globopt::OptimizerFactory<double>::create("CMA-ES");
+    opt->setBounds(lb, ub);
+    opt->setParam("max_function_evaluations", 500);
+    opt->setParam("max_restarts", 0);
+    opt->setParam("seed", 3);
+    const auto res = opt->run(counted, globopt::Vector<double>::Constant(n, 2.0));
+
+    check(res.functionEvaluations <= 500, "cmaes: never exceeds the budget ("
+          + std::to_string(res.functionEvaluations) + ")");
+    check(observed == res.functionEvaluations,
+          "cmaes: reported evaluations match actual objective calls");
+    check(std::abs(res.fval - res.x.squaredNorm()) < 1e-12,
+          "cmaes: reported fval matches the reported x");
+    check(res.iterations > 0, "cmaes: counts generations");
+}
+
+void testCmaesDeterminismAndParams()
+{
+    globopt::Vector<double> lb = globopt::Vector<double>::Constant(3, -5.0);
+    globopt::Vector<double> ub = globopt::Vector<double>::Constant(3, 5.0);
+    globopt::Vector<double> x0 = globopt::Vector<double>::Constant(3, 2.0);
+
+    auto runSeeded = [&](const long long seed, const long long population) {
+        auto opt = globopt::OptimizerFactory<double>::create("CMA-ES");
+        opt->setBounds(lb, ub);
+        opt->setParam("max_function_evaluations", 600);
+        opt->setParam("seed", seed);
+        if (population > 0) {
+            opt->setParam("population_size", population);
+        }
+        return opt->run(&sphere<double>, x0);
+    };
+
+    const auto first = runSeeded(21, 0);
+    const auto again = runSeeded(21, 0);
+    const auto other = runSeeded(22, 0);
+    check(first.fval == again.fval && (first.x - again.x).norm() == 0.0,
+          "cmaes determinism: same seed reproduces the run exactly");
+    check(other.fval != first.fval, "cmaes determinism: a different seed explores differently");
+
+    const auto big = runSeeded(21, 20);
+    check(big.iterations <= 600 / 20 + 1,
+          "cmaes: population_size honoured (" + std::to_string(big.iterations)
+          + " generations for 600 evaluations)");
+
+    globopt::CMAES<double> invalid;
+    invalid.setParam("population_increase_factor", 0.5);
+    check(invalid.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "cmaes: population_increase_factor < 1 rejected");
+}
+
+// -- scalable DIRECTGOLib problems -------------------------------------------
+
+void testScalableProblems()
+{
+    using namespace globopt::benchmarks;
+
+    check(!allScalableProblems().empty(), "scalable: the suite is non-empty");
+
+    const ScalableProblem& sphereProblem = scalableProblem("Sphere");
+    const Problem p5 = sphereProblem.at(5);
+    check(p5.dimensions() == 5, "scalable: at(n) sets the dimension");
+    check(p5.lower.size() == 5 && p5.upper.size() == 5, "scalable: bounds match the dimension");
+    check(std::abs(p5.objective(globopt::Vector<double>::Zero(5))) < 1e-12,
+          "scalable: Sphere evaluates correctly");
+
+    bool threw = false;
+    try {
+        scalableProblem("NoSuchProblem");
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check(threw, "scalable: unknown problem name throws");
+
+    // The stated global minimum must actually be attained at the stated
+    // minimizer, at every dimension - this is what the go_benchmark suite gets
+    // wrong for four of its problems.
+    int mismatches = 0;
+    std::string firstBad;
+    for (const globopt::Index n : {2, 5, 10}) {
+        for (const auto& sp : allScalableProblems()) {
+            const Problem p = sp.at(n);
+            if (p.globalOptima.empty()) {
+                continue;
+            }
+            const double f = p.objective(p.globalOptima[0]);
+            if (std::abs(f - p.fglob) > 1e-6 * std::max(1.0, std::abs(p.fglob))) {
+                ++mismatches;
+                if (firstBad.empty()) {
+                    firstBad = p.name + " at n=" + std::to_string(n) + ": f(xmin) = "
+                        + std::to_string(f) + " but fglob = " + std::to_string(p.fglob);
+                }
+            }
+        }
+    }
+    check(mismatches == 0, "scalable: every stated optimum attains its stated fglob"
+          + (firstBad.empty() ? std::string() : " (" + firstBad + ")"));
+
+    check(scalableProblemsAt(3).size() == allScalableProblems().size(),
+          "scalable: scalableProblemsAt materializes the whole suite");
+}
+
 void testUnboundedBooth()
 {
     auto opt = globopt::OptimizerFactory<double>::create("l_bfgs");
@@ -1029,7 +1253,7 @@ void testParamInterface()
     check(!opt->listParams().empty(), "params: listParams non-empty");
     check(std::string(opt->name()) == "L-BFGS", "optimizer: name");
 
-    check(globopt::OptimizerFactory<double>::available().size() == 5, "factory: five optimizers available");
+    check(globopt::OptimizerFactory<double>::available().size() == 6, "factory: six optimizers available");
     check(std::string(globopt::OptimizerFactory<double>::create("MaxLIPO")->name()) == "LIPO",
           "factory: LIPO by name");
     check(std::string(globopt::OptimizerFactory<double>::create("l-bfgs-b")->name()) == "L-BFGS-B",
@@ -1038,6 +1262,8 @@ void testParamInterface()
           "factory: AMPGO by name");
     check(std::string(globopt::OptimizerFactory<double>::create("Bayesian")->name()) == "EGO",
           "factory: EGO by name");
+    check(std::string(globopt::OptimizerFactory<double>::create("cma-es")->name()) == "CMA-ES",
+          "factory: CMA-ES by name");
 }
 
 void testInvalidInput()
@@ -1087,6 +1313,12 @@ int main()
     testEgoBudgetAndResult();
     testEgoDeterminism();
     testEgoRefitInterval();
+    testCmaesUnimodal();
+    testCmaesRestarts();
+    testCmaesUnbounded();
+    testCmaesResultConsistency();
+    testCmaesDeterminismAndParams();
+    testScalableProblems();
     testFloatScalar();
     testLbfgsbFloatScalar();
     testParamInterface();

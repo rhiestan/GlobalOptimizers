@@ -87,4 +87,6 @@ if (GLOBOPT_BUILD_TESTS)
         COMMAND run_ampgo_benchmarks 12345 EGO --stride 40 --budget 60 --refit-interval 5)
     add_test(NAME benchmark_subset_lipo
         COMMAND run_ampgo_benchmarks 12345 LIPO --stride 40 --budget 200)
+    add_test(NAME benchmark_scalable_cmaes
+        COMMAND run_ampgo_benchmarks 12345 CMA-ES --scalable 5,10 --budget 5000)
 endif()

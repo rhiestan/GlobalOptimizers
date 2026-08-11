@@ -50,6 +50,7 @@ Box constraints are supported through `optimizer->setBounds(lower, upper)` (use 
 | `AMPGO` | global | Adaptive Memory Programming for Global Optimization (Lasdon, Duarte, Glover, Laguna, Martí): local minimization alternated with tabu tunneling; ported from Andrea Gavana's Python implementation |
 | `LIPO` | global, derivative-free, requires finite bounds | MaxLIPO+TR (Malherbe & Vayatis LIPO upper bound + trust-region refinement); ported from [dlib](http://dlib.net)'s `global_function_search` |
 | `EGO` | global, derivative-free, requires finite bounds | Efficient Global Optimization (Jones, Schonlau, Welch): Bayesian optimization with a Kriging surrogate and expected-improvement infill; ported from [SMT](https://github.com/SMTorg/smt)'s `EGO` application and Kriging core |
+| `CMA-ES` | global, derivative-free, bounds optional | Covariance Matrix Adaptation Evolution Strategy (Hansen & Ostermeier) with IPOP restarts (Auger & Hansen); implemented from the published algorithm |
 
 Planned: further global optimizers.
 
@@ -140,6 +141,27 @@ EGO is derivative-free and requires finite box bounds. It evaluates an initial L
 
 The hyperparameter search dominates EGO's own runtime — over 95% of it on the benchmark suite, since every likelihood evaluation factorizes the correlation matrix of all samples so far. `hyperparameter_refit_interval` trades some of that away: with interval *k* the length scales are re-estimated only every *k*-th infill iteration and the surrogate is merely re-conditioned on the new sample in between, which cuts EGO's overhead almost exactly by a factor of *k*. The default 1 reproduces SMT's every-iteration behaviour; values of 5–10 are a good trade when the objective is cheap enough that EGO's own cost is what limits you.
 
+### CMA-ES parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_function_evaluations` | 0 | maximum number of function evaluations (0 = max(1000, 200·n)) |
+| `population_size` | 0 | population size λ (0 = 4 + ⌊3·ln n⌋) |
+| `initial_step_size` | 0 | initial step size σ in normalized coordinates (0 = 0.3, about a third of the box) |
+| `max_restarts` | 9 | number of IPOP restarts after a converged run (0 = a single run) |
+| `population_increase_factor` | 2 | factor applied to the population size on each restart (IPOP: 2) |
+| `tolerance_function` | 1e-12 | restart when the objective range within a generation and over recent history falls below this |
+| `tolerance_x` | 1e-12 | restart when the search distribution collapses below this in every coordinate |
+| `max_condition_number` | 1e14 | restart when the covariance matrix becomes worse conditioned than this |
+| `boundary_penalty` | 1 | weight of the quadratic penalty outside the box, relative to the spread of objective values |
+| `target_objective` | -inf | value of the global optimum, if known (-inf to disable) |
+| `tolerance` | 1e-5 | stop when the best objective is within this distance of `target_objective` |
+| `seed` | 0 | random seed (0 = non-deterministic) |
+
+CMA-ES is derivative-free and, unlike LIPO and EGO, does not require bounds — it is the right default when the objective is cheap and no gradient is available. It samples each generation from a multivariate normal whose covariance is adapted to the local landscape, which is what lets it handle ill-conditioned and non-separable problems that defeat coordinate-wise methods: a 10-D ellipsoid with condition number 10⁶ is solved in about 12000 evaluations.
+
+Plain CMA-ES is a *local* search, so the IPOP restart scheme (restart on convergence with a doubled population from a fresh random mean) is enabled by default and is what makes it global; set `max_restarts` to 0 for a single run. When bounds are set the search runs in coordinates that map the box to [0, 1]ⁿ, so an anisotropic box needs no manual rescaling; points outside the box are evaluated at their clamped position and ranked with a quadratic penalty, and the reported solution is always feasible. The active (negative-weight) covariance update and separable/diagonal variants are not implemented.
+
 ## Benchmarks
 
 `include/globopt/benchmarks/go_benchmark.hpp` contains all 202 problems of the `go_benchmark.py` suite accompanying AMPGO (bounds, formulas and reference optima follow the Python source exactly, quirks included — e.g. its "Easom" is Ackley-shaped, and a few `fglob` values differ from the formula's true minimum). Four problems (`Keane`, `CosineMixture`, `Holzman`, `SchmidtVetters`) state an `fglob` that the objective beats immediately — `Keane` is a maximization problem in the Python suite — so every optimizer scores a free "solved" on them in one to three evaluations; the counts below include those four. The `run_ampgo_benchmarks` executable runs AMPGO over the full set:
@@ -159,6 +181,7 @@ The hyperparameter search dominates EGO's own runtime — over 95% of it on the 
 | `--limit N` | stop after `N` problems |
 | `--repeats N` | run each problem with `N` consecutive seeds |
 | `--refit-interval N` | EGO: re-estimate hyperparameters every `N` iterations |
+| `--scalable DIMS` | run the scalable DIRECTGOLib suite at the given comma-separated dimensions (e.g. `--scalable 2,5,10,20`) instead of the fixed-size suite |
 | `--list` | print the selected problems and exit |
 
 Each run reports its wall-clock time, and the summary counts both problems solved to the strict 1e-6 target and runs that land within a 1% relative gap of `fglob` — the latter matters for EGO, which is built to get close in very few evaluations rather than to converge to the last digit.
@@ -167,7 +190,28 @@ Each run reports its wall-clock time, and the summary counts both problems solve
 ./build/run_ampgo_benchmarks 12345 EGO --stride 20   # ~11 problems, a couple of minutes
 ```
 
-With the default seed, AMPGO solves 179 of 202 problems within a 20000-evaluation budget per problem (average ~3200 evaluations), and LIPO solves 146 of 202 within a 500-evaluation budget (median 41 evaluations on solved problems). EGO solves 39 of 202 within a 200-evaluation budget (median 24 evaluations on solved problems) and lands within a 1% relative gap of `fglob` on 89 of 202 — the fairer figure at a budget 2.5× smaller than LIPO's and 100× smaller than AMPGO's, since expected-improvement search closes in on the basin quickly but has no mechanism for polishing the last digits. Its successes are concentrated in low dimension (15 of 18 one-dimensional and 20 of 156 two-dimensional problems, none above four), and it is markedly seed-sensitive: over five seeds, Ackley ranges from 0.44 to 3.05. The full EGO sweep takes ~2.5 h; `--refit-interval 5` brings that down to ~35 min and, on this suite, costs nothing measurable (better on 94 problems, worse on 74 — within seed noise). The misses are plateau/stair-step functions (Corana, Gear, Mishra10), noisy objectives that draw random weights on every evaluation (Stochastic, XinSheYang01), and highly oscillatory landscapes (Bukin06, Easom, Griewank, Salomon, Schaffer01/02, Ripple01, SineEnvelope, Trefethen, Wavy, Weierstrass, Pathological, CrownedCross, Deceptive, DeVilliersGlasser02, Mishra04, XinSheYang03, Zimmerman) that are hard for any gradient-based tunneling method.
+### Scalable problems
+
+`include/globopt/benchmarks/directgo_benchmark.hpp` adds 30 problems ported from [DIRECTGOLib](https://github.com/blockchain-group/DIRECTGOLib) v2.0 (MIT). Unlike the `go_benchmark` suite — which is 156/202 two-dimensional — these are defined for *any* number of variables, which is what makes it possible to measure how an optimizer degrades with dimension:
+
+```sh
+./build/run_ampgo_benchmarks 12345 CMA-ES --scalable 2,5,10,20,40
+```
+
+Each problem exposes bounds, the global minimum and a minimizer as functions of `n` (`ScalableProblem::at(n)` materializes an ordinary `Problem`). The test suite checks that every stated optimum really attains its stated `fglob` at several dimensions — the check that the fixed-size suite fails on four problems.
+
+Problems solved (of 30) at the default seed, per optimizer and dimension:
+
+| Optimizer | budget | n=2 | n=5 | n=10 | n=20 | n=40 |
+|-----------|-------:|----:|----:|-----:|-----:|-----:|
+| `CMA-ES` | 20000 | 28 | 25 | 25 | 24 | 19 |
+| `AMPGO` (with gradients) | 20000 | 28 | 23 | 23 | 23 | — |
+| `LIPO` | 500 | 26 | 13 | 5 | 4 | — |
+| `EGO` | 200 | 4 | 0 | 0 | — | — |
+
+Read the budgets before the columns: LIPO's 500 and EGO's 200 evaluations are deliberate design points — both target objectives too expensive to sample 20000 times — so the table shows how each method behaves *in its own regime*, not a like-for-like race. EGO's row in particular is close to meaningless as a ranking: 200 evaluations spread over 10 dimensions is roughly 20 per dimension, and the strict 1e-6 target asks for a last-digit convergence it never attempts. What it does show cleanly is the shape of the degradation: CMA-ES loses ground slowly and its average cost grows from ~1800 to ~12400 evaluations, while the Lipschitz upper bound LIPO fits becomes uninformative in higher dimensions. The problems CMA-ES does not solve are the deceptive multimodal ones — Schwefel, Rastrigin, Salomon and Dixon-Price.
+
+With the default seed, AMPGO solves 179 of 202 problems within a 20000-evaluation budget per problem (average ~3200 evaluations), and LIPO solves 146 of 202 within a 500-evaluation budget (median 41 evaluations on solved problems). CMA-ES solves 182 of 202 within a 20000-evaluation budget (average ~3100 evaluations, 0.3 s for the whole sweep) — the best result here, and without needing gradients. EGO solves 39 of 202 within a 200-evaluation budget (median 24 evaluations on solved problems) and lands within a 1% relative gap of `fglob` on 89 of 202 — the fairer figure at a budget 2.5× smaller than LIPO's and 100× smaller than AMPGO's, since expected-improvement search closes in on the basin quickly but has no mechanism for polishing the last digits. Its successes are concentrated in low dimension (15 of 18 one-dimensional and 20 of 156 two-dimensional problems, none above four), and it is markedly seed-sensitive: over five seeds, Ackley ranges from 0.44 to 3.05. The full EGO sweep takes ~2.5 h; `--refit-interval 5` brings that down to ~35 min and, on this suite, costs nothing measurable (better on 94 problems, worse on 74 — within seed noise). The misses are plateau/stair-step functions (Corana, Gear, Mishra10), noisy objectives that draw random weights on every evaluation (Stochastic, XinSheYang01), and highly oscillatory landscapes (Bukin06, Easom, Griewank, Salomon, Schaffer01/02, Ripple01, SineEnvelope, Trefethen, Wavy, Weierstrass, Pathological, CrownedCross, Deceptive, DeVilliersGlasser02, Mishra04, XinSheYang03, Zimmerman) that are hard for any gradient-based tunneling method.
 
 ## Building the tests and examples
 
@@ -185,4 +229,4 @@ Eigen >= 3.4 is required (L-BFGS-B uses Eigen's indexed views). If Eigen is not 
 
 ## License
 
-MPL-2.0. The L-BFGS implementation and the Moré-Thuente line search are ported from [OptimLib](https://github.com/kthohr/optim) (Apache License 2.0, Copyright Keith O'Hara); the L-BFGS-B implementation is ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) (MIT License, Copyright Dane Roemer); AMPGO and the benchmark suite are ported from Andrea Gavana's Python implementation (go_amp.py / go_benchmark.py); LIPO is ported from [dlib](http://dlib.net) (Boost Software License, Copyright Davis E. King); EGO and its Kriging model are ported from [SMT](https://github.com/SMTorg/smt) (New BSD License, Copyright the SMT developers); attribution is retained in the corresponding headers.
+MPL-2.0. The L-BFGS implementation and the Moré-Thuente line search are ported from [OptimLib](https://github.com/kthohr/optim) (Apache License 2.0, Copyright Keith O'Hara); the L-BFGS-B implementation is ported from [l-bfgs-b](https://github.com/droemer7/l-bfgs-b) (MIT License, Copyright Dane Roemer); AMPGO and the benchmark suite are ported from Andrea Gavana's Python implementation (go_amp.py / go_benchmark.py); LIPO is ported from [dlib](http://dlib.net) (Boost Software License, Copyright Davis E. King); EGO and its Kriging model are ported from [SMT](https://github.com/SMTorg/smt) (New BSD License, Copyright the SMT developers); the scalable benchmark problems are ported from [DIRECTGOLib](https://github.com/blockchain-group/DIRECTGOLib) (MIT License, Copyright the Blockchain Technologies Group); attribution is retained in the corresponding headers. CMA-ES is not a port: it is implemented from the published algorithm description.

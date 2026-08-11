@@ -9,8 +9,9 @@
 // optimizer is "AMPGO" (default, 20000-evaluation budget, mirroring the
 // driver in go_amp.py's __main__), "LIPO" (500-evaluation budget: MaxLIPO+TR
 // targets expensive objectives and spends much more model work per
-// evaluation) or "EGO" (200-evaluation budget: Bayesian optimization spends
-// even more model work per evaluation).
+// evaluation), "EGO" (200-evaluation budget: Bayesian optimization spends
+// even more model work per evaluation) or "CMA-ES" (20000-evaluation budget:
+// like AMPGO it assumes the objective is cheap, but needs no gradients).
 //
 // Options (all optional, in any order after the positional arguments):
 //   --budget N           evaluations per problem, overriding the default
@@ -20,6 +21,9 @@
 //   --limit N            stop after N problems have been run
 //   --repeats N          run each problem with N consecutive seeds
 //   --refit-interval N   EGO: re-estimate hyperparameters every N iterations
+//   --scalable DIMS      run the scalable DIRECTGOLib problems at the given
+//                        comma-separated dimensions (e.g. --scalable 2,5,10,20)
+//                        instead of the fixed-size go_benchmark suite
 //   --list               print the selected problems and exit
 //
 // A per-problem wall-clock column makes the cost of the expensive optimizers
@@ -29,6 +33,7 @@
 // tens of times slower.
 
 #include <globopt/globopt.hpp>
+#include <globopt/benchmarks/directgo_benchmark.hpp>
 #include <globopt/benchmarks/go_benchmark.hpp>
 
 #include <algorithm>
@@ -68,7 +73,9 @@ int main(int argc, char** argv)
 
     const bool isLipo = (lowercase(optimizerName) == "lipo");
     const bool isEgo = (lowercase(optimizerName) == "ego");
-    const bool derivativeFree = isLipo || isEgo;
+    const bool isCmaes = (lowercase(optimizerName) == "cmaes" || lowercase(optimizerName) == "cma-es"
+                          || lowercase(optimizerName) == "cma");
+    const bool derivativeFree = isLipo || isEgo || isCmaes;
 
     int budget = isLipo ? 500 : (isEgo ? 200 : 20000);
     std::string filter;
@@ -78,6 +85,7 @@ int main(int argc, char** argv)
     int repeats = 1;
     int refitInterval = 0; // 0 = leave the optimizer default
     bool listOnly = false;
+    std::vector<int> scalableDims;
 
     for (; argi < argc; ++argi) {
         const std::string option = argv[argi];
@@ -104,6 +112,21 @@ int main(int argc, char** argv)
             repeats = std::max(1, std::stoi(value()));
         } else if (option == "--refit-interval") {
             refitInterval = std::stoi(value());
+        } else if (option == "--scalable") {
+            const std::string list = value();
+            std::size_t start = 0;
+            while (start <= list.size()) {
+                const std::size_t comma = list.find(',', start);
+                const std::string item = list.substr(
+                    start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!item.empty()) {
+                    scalableDims.push_back(std::stoi(item));
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
         } else if (option == "--list") {
             listOnly = true;
         } else {
@@ -112,11 +135,28 @@ int main(int argc, char** argv)
         }
     }
 
+    // -- problem pool: the fixed-size suite, or the scalable one at the
+    //    requested dimensions ------------------------------------------------
+    std::vector<globopt::benchmarks::Problem> pool;
+    if (scalableDims.empty()) {
+        pool = globopt::benchmarks::allProblems();
+    } else {
+        for (const int dims : scalableDims) {
+            if (dims < 1) {
+                std::fprintf(stderr, "--scalable dimensions must be at least 1\n");
+                return 2;
+            }
+            for (auto& problem : globopt::benchmarks::scalableProblemsAt(dims)) {
+                pool.push_back(std::move(problem));
+            }
+        }
+    }
+
     // -- problem selection ---------------------------------------------------
     std::vector<const globopt::benchmarks::Problem*> selected;
     {
         int matched = 0;
-        for (const auto& problem : globopt::benchmarks::allProblems()) {
+        for (const auto& problem : pool) {
             if (!filter.empty() && lowercase(problem.name).find(filter) == std::string::npos) {
                 continue;
             }
@@ -154,8 +194,8 @@ int main(int argc, char** argv)
     if (isEgo && refitInterval > 0) {
         std::printf(", refit interval: %d", refitInterval);
     }
-    std::printf("\n%zu of %zu problems selected\n\n", selected.size(),
-                globopt::benchmarks::allProblems().size());
+    std::printf("\n%zu of %zu problems selected (%s suite)\n\n", selected.size(), pool.size(),
+                scalableDims.empty() ? "go_benchmark" : "scalable DIRECTGOLib");
 
     std::printf("%-30s %3s  %14s  %14s  %8s  %8s  %-9s\n",
                 "problem", "n", "fglob", "best f", "fevals", "seconds", "status");
