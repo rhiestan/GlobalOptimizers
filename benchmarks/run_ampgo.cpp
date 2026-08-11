@@ -75,7 +75,9 @@ int main(int argc, char** argv)
     const bool isEgo = (lowercase(optimizerName) == "ego");
     const bool isCmaes = (lowercase(optimizerName) == "cmaes" || lowercase(optimizerName) == "cma-es"
                           || lowercase(optimizerName) == "cma");
-    const bool derivativeFree = isLipo || isEgo || isCmaes;
+    const bool isDe = (lowercase(optimizerName) == "de"
+                       || lowercase(optimizerName) == "differentialevolution");
+    const bool derivativeFree = isLipo || isEgo || isCmaes || isDe;
 
     int budget = isLipo ? 500 : (isEgo ? 200 : 20000);
     std::string filter;

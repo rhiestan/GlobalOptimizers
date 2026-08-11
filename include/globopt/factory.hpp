@@ -8,6 +8,7 @@
 #include "core/optimizer.hpp"
 #include "global/ampgo.hpp"
 #include "global/cmaes.hpp"
+#include "global/de.hpp"
 #include "global/ego.hpp"
 #include "global/lipo.hpp"
 #include "local/lbfgs.hpp"
@@ -28,7 +29,8 @@ enum class Algorithm {
     AMPGO,
     LIPO,
     EGO,
-    CMAES
+    CMAES,
+    DE
 };
 
 template <typename Scalar = double>
@@ -49,6 +51,8 @@ public:
                 return std::make_unique<globopt::EGO<Scalar>>();
             case Algorithm::CMAES:
                 return std::make_unique<globopt::CMAES<Scalar>>();
+            case Algorithm::DE:
+                return std::make_unique<globopt::DifferentialEvolution<Scalar>>();
         }
         throw std::invalid_argument("globopt: unknown algorithm");
     }
@@ -77,13 +81,16 @@ public:
         if (key == "cmaes" || key == "cma" || key == "ipopcmaes") {
             return create(Algorithm::CMAES);
         }
+        if (key == "de" || key == "differentialevolution" || key == "jde") {
+            return create(Algorithm::DE);
+        }
 
         throw std::invalid_argument("globopt: unknown optimizer '" + name + "'");
     }
 
     static std::vector<std::string> available()
     {
-        return {"L-BFGS", "L-BFGS-B", "AMPGO", "LIPO", "EGO", "CMA-ES"};
+        return {"L-BFGS", "L-BFGS-B", "AMPGO", "LIPO", "EGO", "CMA-ES", "DE"};
     }
 
 private:

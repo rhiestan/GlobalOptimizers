@@ -16,6 +16,7 @@
 
 #include "global/ampgo.hpp"
 #include "global/cmaes.hpp"
+#include "global/de.hpp"
 #include "global/ego.hpp"
 #include "global/lipo.hpp"
 

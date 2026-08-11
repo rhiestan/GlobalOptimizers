@@ -1145,6 +1145,165 @@ void testCmaesDeterminismAndParams()
           "cmaes: population_increase_factor < 1 rejected");
 }
 
+// -- Differential Evolution ---------------------------------------------------
+
+void testDeSolves()
+{
+    struct Case {
+        const char* label;
+        globopt::Index n;
+        double lo, hi;
+        globopt::ObjectiveFunction<double> f;
+    };
+
+    const Case cases[] = {
+        {"sphere(10)", 10, -5.0, 5.0, &sphere<double>},
+        {"rastrigin(5)", 5, -5.12, 5.12, &rastrigin<double>},
+        {"rosenbrock(5)", 5, -5.0, 10.0, &rosenbrockN<double>},
+    };
+
+    for (const auto& c : cases) {
+        auto opt = globopt::OptimizerFactory<double>::create("DE");
+        opt->setBounds(globopt::Vector<double>::Constant(c.n, c.lo),
+                       globopt::Vector<double>::Constant(c.n, c.hi));
+        opt->setParam("max_function_evaluations", 60000);
+        opt->setParam("target_objective", 0.0);
+        opt->setParam("tolerance", 1e-6);
+        opt->setParam("seed", 4);
+
+        const auto res = opt->run(c.f, globopt::Vector<double>::Constant(c.n, c.hi * 0.6));
+        check(res.success(), std::string("de ") + c.label + ": reaches the optimum ("
+              + std::string(toString(res.status)) + ", f = " + std::to_string(res.fval) + ")");
+    }
+}
+
+// Every documented strategy and bound-handling mode must run, respect the box
+// and make progress.
+void testDeStrategies()
+{
+    const globopt::Index n = 5;
+    globopt::Vector<double> lb = globopt::Vector<double>::Constant(n, -5.0);
+    globopt::Vector<double> ub = globopt::Vector<double>::Constant(n, 5.0);
+    globopt::Vector<double> x0 = globopt::Vector<double>::Constant(n, 4.0);
+    const double startValue = x0.squaredNorm();
+
+    auto runWith = [&](const char* param, const char* value) {
+        auto opt = globopt::OptimizerFactory<double>::create("DE");
+        opt->setBounds(lb, ub);
+        opt->setParam("max_function_evaluations", 4000);
+        opt->setParam("seed", 9);
+        opt->setParam(param, value);
+        const auto res = opt->run(&sphere<double>, x0);
+
+        const std::string label = std::string("de (") + param + " = " + value + ")";
+        check(res.status != globopt::Status::InvalidInput, label + ": accepted");
+        check(res.fval < 0.01 * startValue, label + ": improves on the start point (f = "
+              + std::to_string(res.fval) + ")");
+        check((res.x.array() >= lb.array()).all() && (res.x.array() <= ub.array()).all(),
+              label + ": stays inside the box");
+    };
+
+    for (const char* strategy : {"rand/1/bin", "best/1/bin", "rand/2/bin", "best/2/bin",
+                                 "current-to-best/1/bin", "rand/1/exp", "best/1/exp"}) {
+        runWith("strategy", strategy);
+    }
+    for (const char* bounds : {"reflect", "clip", "random"}) {
+        runWith("bound_handling", bounds);
+    }
+}
+
+// jDE adapts F and CR per individual; both modes must work, and the
+// self-adaptive default should not be worse on a standard multimodal problem.
+void testDeSelfAdaptation()
+{
+    const globopt::Index n = 5;
+    auto run = [&](const bool selfAdaptive) {
+        auto opt = globopt::OptimizerFactory<double>::create("DE");
+        opt->setBounds(globopt::Vector<double>::Constant(n, -5.12),
+                       globopt::Vector<double>::Constant(n, 5.12));
+        opt->setParam("max_function_evaluations", 20000);
+        opt->setParam("seed", 13);
+        opt->setParam("self_adaptive", selfAdaptive);
+        return opt->run(&rastrigin<double>, globopt::Vector<double>::Constant(n, 4.0));
+    };
+
+    const auto adaptive = run(true);
+    const auto fixed = run(false);
+
+    check(adaptive.status != globopt::Status::InvalidInput, "de jDE: self-adaptive run accepted");
+    check(fixed.status != globopt::Status::InvalidInput, "de jDE: fixed-parameter run accepted");
+    check(adaptive.fval <= fixed.fval + 1e-9,
+          "de jDE: self-adaptation is no worse on rastrigin(5) ("
+          + std::to_string(adaptive.fval) + " vs " + std::to_string(fixed.fval) + ")");
+}
+
+void testDeValidationAndResult()
+{
+    globopt::DifferentialEvolution<double> opt;
+    globopt::Vector<double> x0 = globopt::Vector<double>::Constant(3, 0.0);
+
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "de: missing bounds rejected");
+
+    globopt::Vector<double> lb = globopt::Vector<double>::Constant(3, -1.0);
+    globopt::Vector<double> ub = globopt::Vector<double>::Constant(3, 1.0);
+    ub(1) = std::numeric_limits<double>::infinity();
+    opt.setBounds(lb, ub);
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "de: non-finite bounds rejected");
+
+    ub(1) = 1.0;
+    opt.setBounds(lb, ub);
+    opt.setParam("strategy", "nonsense/9/bin");
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "de: unknown strategy rejected");
+    opt.setParam("strategy", "rand/1/bin");
+    opt.setParam("bound_handling", "nonsense");
+    check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+          "de: unknown bound_handling rejected");
+
+    // budget and reported result must agree. The start point is deliberately
+    // away from the optimum: seeding the population with the exact minimum
+    // would make every run return the same value and hide a broken seed.
+    const globopt::Vector<double> offOptimum = globopt::Vector<double>::Constant(3, 0.9);
+
+    std::size_t observed = 0;
+    auto counted = [&](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        ++observed;
+        return x.squaredNorm();
+    };
+    auto budgeted = globopt::OptimizerFactory<double>::create("DE");
+    budgeted->setBounds(lb, ub);
+    budgeted->setParam("max_function_evaluations", 250);
+    budgeted->setParam("population_size", 25);
+    budgeted->setParam("seed", 2);
+    const auto res = budgeted->run(counted, offOptimum);
+
+    check(res.functionEvaluations <= 250, "de: never exceeds the budget ("
+          + std::to_string(res.functionEvaluations) + ")");
+    check(observed == res.functionEvaluations,
+          "de: reported evaluations match actual objective calls");
+    check(std::abs(res.fval - res.x.squaredNorm()) < 1e-12,
+          "de: reported fval matches the reported x");
+    check(res.message.find("population 25") != std::string::npos,
+          "de: population_size honoured (" + res.message + ")");
+
+    auto seeded = [&](const long long seed) {
+        auto o = globopt::OptimizerFactory<double>::create("DE");
+        o->setBounds(lb, ub);
+        o->setParam("max_function_evaluations", 120);
+        o->setParam("seed", seed);
+        return o->run(&sphere<double>, offOptimum);
+    };
+    const auto first = seeded(6);
+    const auto again = seeded(6);
+    const auto other = seeded(7);
+    check(first.fval == again.fval && (first.x - again.x).norm() == 0.0,
+          "de determinism: same seed reproduces the run exactly");
+    check(other.fval != first.fval,
+          "de determinism: a different seed explores differently");
+}
+
 // -- scalable DIRECTGOLib problems -------------------------------------------
 
 void testScalableProblems()
@@ -1253,7 +1412,7 @@ void testParamInterface()
     check(!opt->listParams().empty(), "params: listParams non-empty");
     check(std::string(opt->name()) == "L-BFGS", "optimizer: name");
 
-    check(globopt::OptimizerFactory<double>::available().size() == 6, "factory: six optimizers available");
+    check(globopt::OptimizerFactory<double>::available().size() == 7, "factory: seven optimizers available");
     check(std::string(globopt::OptimizerFactory<double>::create("MaxLIPO")->name()) == "LIPO",
           "factory: LIPO by name");
     check(std::string(globopt::OptimizerFactory<double>::create("l-bfgs-b")->name()) == "L-BFGS-B",
@@ -1264,6 +1423,8 @@ void testParamInterface()
           "factory: EGO by name");
     check(std::string(globopt::OptimizerFactory<double>::create("cma-es")->name()) == "CMA-ES",
           "factory: CMA-ES by name");
+    check(std::string(globopt::OptimizerFactory<double>::create("jDE")->name()) == "DE",
+          "factory: DE by name");
 }
 
 void testInvalidInput()
@@ -1318,6 +1479,10 @@ int main()
     testCmaesUnbounded();
     testCmaesResultConsistency();
     testCmaesDeterminismAndParams();
+    testDeSolves();
+    testDeStrategies();
+    testDeSelfAdaptation();
+    testDeValidationAndResult();
     testScalableProblems();
     testFloatScalar();
     testLbfgsbFloatScalar();
