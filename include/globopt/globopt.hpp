@@ -11,6 +11,7 @@
 #include "core/optimizer.hpp"
 #include "core/numerical_gradient.hpp"
 
+#include "local/bobyqa.hpp"
 #include "local/lbfgs.hpp"
 #include "local/lbfgsb.hpp"
 

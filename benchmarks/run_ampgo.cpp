@@ -10,8 +10,11 @@
 // driver in go_amp.py's __main__), "LIPO" (500-evaluation budget: MaxLIPO+TR
 // targets expensive objectives and spends much more model work per
 // evaluation), "EGO" (200-evaluation budget: Bayesian optimization spends
-// even more model work per evaluation) or "CMA-ES" (20000-evaluation budget:
-// like AMPGO it assumes the objective is cheap, but needs no gradients).
+// even more model work per evaluation), "CMA-ES" (20000-evaluation budget:
+// like AMPGO it assumes the objective is cheap, but needs no gradients) or
+// "BOBYQA" (20000-evaluation budget, though as a purely local optimizer it
+// converges long before that: it measures how often a random start lands in
+// the basin of the global optimum, not global search quality).
 //
 // Options (all optional, in any order after the positional arguments):
 //   --budget N           evaluations per problem, overriding the default
@@ -21,6 +24,10 @@
 //   --limit N            stop after N problems have been run
 //   --repeats N          run each problem with N consecutive seeds
 //   --refit-interval N   EGO: re-estimate hyperparameters every N iterations
+//   --polish             follow each run with a BOBYQA local refinement from
+//                        its result (dlib's find_min_global pattern); the
+//                        reported evaluation count is the sum of both stages
+//   --polish-budget N    evaluations for the refinement (default 500)
 //   --scalable DIMS      run the scalable DIRECTGOLib problems at the given
 //                        comma-separated dimensions (e.g. --scalable 2,5,10,20)
 //                        instead of the fixed-size go_benchmark suite
@@ -77,7 +84,8 @@ int main(int argc, char** argv)
                           || lowercase(optimizerName) == "cma");
     const bool isDe = (lowercase(optimizerName) == "de"
                        || lowercase(optimizerName) == "differentialevolution");
-    const bool derivativeFree = isLipo || isEgo || isCmaes || isDe;
+    const bool isBobyqa = (lowercase(optimizerName) == "bobyqa");
+    const bool derivativeFree = isLipo || isEgo || isCmaes || isDe || isBobyqa;
 
     int budget = isLipo ? 500 : (isEgo ? 200 : 20000);
     std::string filter;
@@ -86,6 +94,8 @@ int main(int argc, char** argv)
     int limit = 0;      // 0 = no limit
     int repeats = 1;
     int refitInterval = 0; // 0 = leave the optimizer default
+    bool polish = false;
+    int polishBudget = 500;
     bool listOnly = false;
     std::vector<int> scalableDims;
 
@@ -114,6 +124,10 @@ int main(int argc, char** argv)
             repeats = std::max(1, std::stoi(value()));
         } else if (option == "--refit-interval") {
             refitInterval = std::stoi(value());
+        } else if (option == "--polish") {
+            polish = true;
+        } else if (option == "--polish-budget") {
+            polishBudget = std::stoi(value());
         } else if (option == "--scalable") {
             const std::string list = value();
             std::size_t start = 0;
@@ -209,6 +223,7 @@ int main(int argc, char** argv)
 
     // The strict 1e-6 target undersells optimizers that are meant to get close
     // in very few evaluations, so near misses are counted separately.
+    const double targetTolerance = 1e-6;
     const double closeTolerance = 1e-2;
     auto relativeGap = [](const double fval, const double fglob) {
         return std::abs(fval - fglob) / std::max(1.0, std::abs(fglob));
@@ -222,9 +237,12 @@ int main(int argc, char** argv)
             auto opt = globopt::OptimizerFactory<double>::create(optimizerName);
             opt->setBounds(problem->lower, problem->upper);
             opt->setParam("target_objective", problem->fglob);
-            opt->setParam("tolerance", 1e-6);
+            opt->setParam("tolerance", targetTolerance);
             opt->setParam("max_function_evaluations", budget);
-            opt->setParam("seed", static_cast<long long>(runSeed));
+            if (!isBobyqa) {
+                // BOBYQA is deterministic; the seed only varies its start point
+                opt->setParam("seed", static_cast<long long>(runSeed));
+            }
             if (!derivativeFree) {
                 opt->setParam("total_iterations", 2000);
             }
@@ -252,13 +270,38 @@ int main(int argc, char** argv)
             const auto x0 = problem->randomStart(rng);
 
             const auto start = std::chrono::steady_clock::now();
-            const auto res = opt->run(objective, x0);
+            auto res = opt->run(objective, x0);
+
+            if (polish && !isBobyqa) {
+                // dlib's find_min_global pattern: the global search locates the
+                // basin, then BOBYQA converges inside it without gradients
+                auto polisher = globopt::OptimizerFactory<double>::create("BOBYQA");
+                polisher->setBounds(problem->lower, problem->upper);
+                polisher->setParam("target_objective", problem->fglob);
+                polisher->setParam("tolerance", targetTolerance);
+                polisher->setParam("max_function_evaluations", polishBudget);
+
+                const auto refined = polisher->run(objective, res.x);
+                res.functionEvaluations += refined.functionEvaluations;
+                if (refined.fval < res.fval) {
+                    res.fval = refined.fval;
+                    res.x = refined.x;
+                }
+            }
+
             const double seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
+            // "Solved" is decided from the objective value, not from the
+            // optimizer's status: the global optimizers report success exactly
+            // when they reach the target set below, but a local optimizer such
+            // as BOBYQA also reports success when it merely converges, which
+            // says nothing about whether it found the global optimum.
+            const bool solvedRun = (res.fval <= problem->fglob + targetTolerance);
+
             totalEvals += static_cast<long long>(res.functionEvaluations);
             totalSeconds += seconds;
-            if (res.success()) {
+            if (solvedRun) {
                 ++solved;
             }
             if (relativeGap(res.fval, problem->fglob) <= closeTolerance) {
@@ -268,7 +311,7 @@ int main(int argc, char** argv)
             std::printf("%-30s %3d  %14.6g  %14.6g  %8zu  %8.2f  %-9s\n",
                         problem->name.c_str(), static_cast<int>(problem->dimensions()),
                         problem->fglob, res.fval, res.functionEvaluations, seconds,
-                        res.success() ? "solved" : toString(res.status));
+                        solvedRun ? "solved" : toString(res.status));
             std::fflush(stdout);
         }
     }

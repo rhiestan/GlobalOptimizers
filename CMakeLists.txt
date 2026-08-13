@@ -91,4 +91,8 @@ if (GLOBOPT_BUILD_TESTS)
         COMMAND run_ampgo_benchmarks 12345 CMA-ES --scalable 5,10 --budget 5000)
     add_test(NAME benchmark_scalable_de
         COMMAND run_ampgo_benchmarks 12345 DE --scalable 5,10 --budget 5000)
+    add_test(NAME benchmark_subset_bobyqa
+        COMMAND run_ampgo_benchmarks 12345 BOBYQA --stride 10)
+    add_test(NAME benchmark_polish
+        COMMAND run_ampgo_benchmarks 12345 CMA-ES --stride 10 --budget 5000 --polish)
 endif()

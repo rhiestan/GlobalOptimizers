@@ -242,6 +242,228 @@ void testLbfgsbFloatScalar()
     check(res.x.norm() < 1e-2f, "lbfgsb sphere<float>: solution near origin");
 }
 
+int g_gradientRequests = 0;
+
+template <typename Scalar>
+Scalar rosenbrockCountingGradients(const globopt::Vector<Scalar>& x, globopt::Vector<Scalar>* grad)
+{
+    if (grad) {
+        ++g_gradientRequests;
+    }
+    return rosenbrock<Scalar>(x, grad);
+}
+
+void testBobyqaRosenbrock()
+{
+    auto opt = globopt::OptimizerFactory<double>::create("BOBYQA");
+
+    globopt::Vector<double> lb(2), ub(2), x0(2);
+    lb << -5.0, -5.0;
+    ub << 10.0, 10.0;
+    x0 << -1.2, 1.0;
+    opt->setBounds(lb, ub);
+
+    g_gradientRequests = 0;
+    const auto res = opt->run(&rosenbrockCountingGradients<double>, x0);
+
+    check(res.success(), "bobyqa rosenbrock: converged (" + std::string(toString(res.status)) + ")");
+    check((res.x - globopt::Vector<double>::Ones(2)).norm() < 1e-5,
+          "bobyqa rosenbrock: solution near (1, 1)");
+    check(res.fval < 1e-10, "bobyqa rosenbrock: objective near zero");
+    check(g_gradientRequests == 0, "bobyqa rosenbrock: objective never asked for a gradient");
+    check(res.functionEvaluations > 0 && res.iterations > 0,
+          "bobyqa rosenbrock: evaluation and iteration counts reported");
+    check(std::isnan(res.gradientNorm), "bobyqa rosenbrock: gradient norm reported as NaN");
+}
+
+void testBobyqaUnbounded()
+{
+    // unlike LIPO and EGO, BOBYQA does not need bounds
+    globopt::BOBYQA<double> opt;
+
+    globopt::Vector<double> x0(2);
+    x0 << -1.2, 1.0;
+
+    const auto res = opt.run(&rosenbrock<double>, x0);
+
+    check(res.success(), "bobyqa rosenbrock (unbounded): converged ("
+          + std::string(toString(res.status)) + ")");
+    check((res.x - globopt::Vector<double>::Ones(2)).norm() < 1e-5,
+          "bobyqa rosenbrock (unbounded): solution near (1, 1)");
+}
+
+void testBobyqaBoundaryOptimum()
+{
+    // the same boundary-optimum regression as for L-BFGS-B: the constrained
+    // minimum of Booth subject to y <= 2 lies ON the bound, at (1.8, 2)
+    auto opt = globopt::OptimizerFactory<double>::create("bobyqa");
+
+    globopt::Vector<double> lb(2), ub(2), expected(2), x0(2);
+    lb << -5.0, -5.0;
+    ub << 5.0, 2.0;
+    expected << 1.8, 2.0;
+    x0 << 0.0, 0.0;
+    opt->setBounds(lb, ub);
+
+    const auto res = opt->run(&booth<double>, x0);
+
+    check(res.success(), "bobyqa booth (boundary optimum): converged ("
+          + std::string(toString(res.status)) + ")");
+    check((res.x - expected).norm() < 1e-5, "bobyqa booth (boundary optimum): solution near (1.8, 2)");
+    check(std::abs(res.fval - 1.8) < 1e-8, "bobyqa booth (boundary optimum): objective near 1.8");
+    check(res.x(1) == ub(1), "bobyqa booth (boundary optimum): active bound met exactly");
+    check((res.x.array() >= lb.array()).all() && (res.x.array() <= ub.array()).all(),
+          "bobyqa booth (boundary optimum): bounds respected");
+}
+
+void testBobyqaAnisotropicBox()
+{
+    // the box spans eight orders of magnitude between the two coordinates;
+    // the internal rescaling is what makes this solvable without the caller
+    // having to normalize the problem
+    auto quadratic = [](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        return (x(0) - 1e-4) * (x(0) - 1e-4) + 1e-8 * (x(1) - 5000.0) * (x(1) - 5000.0);
+    };
+
+    globopt::BOBYQA<double> opt;
+
+    globopt::Vector<double> lb(2), ub(2), x0(2);
+    lb << -1e-3, -1e5;
+    ub << 1e-3, 1e5;
+    x0 << 0.0, 0.0;
+    opt.setBounds(lb, ub);
+
+    const auto res = opt.run(quadratic, x0);
+
+    check(res.success(), "bobyqa anisotropic box: converged ("
+          + std::string(toString(res.status)) + ")");
+    check(std::abs(res.x(0) - 1e-4) < 1e-9 && std::abs(res.x(1) - 5000.0) < 1e-3,
+          "bobyqa anisotropic box: both coordinates located");
+}
+
+void testBobyqaBudgetAndTarget()
+{
+    {
+        auto opt = globopt::OptimizerFactory<double>::create("BOBYQA");
+        opt->setParam("max_function_evaluations", 30);
+
+        globopt::Vector<double> x0(2);
+        x0 << -1.2, 1.0;
+
+        const auto res = opt->run(&rosenbrock<double>, x0);
+
+        check(res.status == globopt::Status::MaxFunctionEvaluationsReached,
+              "bobyqa budget: evaluation limit reported");
+        check(res.functionEvaluations <= 30, "bobyqa budget: evaluation budget respected");
+    }
+    {
+        auto opt = globopt::OptimizerFactory<double>::create("BOBYQA");
+        opt->setParam("target_objective", 0.0);
+        opt->setParam("tolerance", 1e-3);
+
+        globopt::Vector<double> x0(3);
+        x0 << 1.0, -2.0, 3.0;
+
+        const auto res = opt->run(&sphere<double>, x0);
+
+        check(res.success() && res.fval < 1e-3,
+              "bobyqa target: stops once the target objective is reached");
+    }
+}
+
+void testBobyqaPolishesGlobalResult()
+{
+    // the intended pairing: a global search locates the basin, BOBYQA
+    // converges inside it without needing gradients
+    const auto& branin = globopt::benchmarks::problem("Branin01");
+
+    auto objective = [&](const globopt::Vector<double>& x, globopt::Vector<double>*) {
+        return branin.objective(x);
+    };
+
+    auto global = globopt::OptimizerFactory<double>::create("LIPO");
+    global->setBounds(branin.lower, branin.upper);
+    global->setParam("max_function_evaluations", 60);
+    global->setParam("seed", 7);
+
+    std::mt19937_64 rng(7);
+    const auto coarse = global->run(objective, branin.randomStart(rng));
+
+    auto polish = globopt::OptimizerFactory<double>::create("BOBYQA");
+    polish->setBounds(branin.lower, branin.upper);
+    const auto refined = polish->run(objective, coarse.x);
+
+    check(refined.fval <= coarse.fval,
+          "bobyqa polish: never worse than the global optimizer's result ("
+          + std::to_string(coarse.fval) + " -> " + std::to_string(refined.fval) + ")");
+    check(refined.fval < branin.fglob + 1e-8,
+          "bobyqa polish: converges to the global optimum of Branin01");
+}
+
+void testBobyqaParamValidation()
+{
+    globopt::Vector<double> x0(2), lb(2), ub(2);
+    x0 << 0.0, 0.0;
+    lb << -1.0, -1.0;
+    ub << 1.0, 1.0;
+
+    {
+        globopt::BOBYQA<double> opt;
+        opt.setBounds(lb, ub);
+        opt.setParam("interpolation_points", 3);  // < n + 2
+        check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+              "bobyqa: too few interpolation points rejected");
+    }
+    {
+        globopt::BOBYQA<double> opt;
+        opt.setBounds(lb, ub);
+        opt.setParam("interpolation_points", 7);  // > (n + 1)(n + 2)/2
+        check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+              "bobyqa: too many interpolation points rejected");
+    }
+    {
+        globopt::BOBYQA<double> opt;
+        opt.setBounds(lb, ub);
+        opt.setParam("final_trust_region_radius", 1.0);  // > initial
+        check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+              "bobyqa: final radius above the initial one rejected");
+    }
+    {
+        // the box is mapped to unit width internally, so this leaves no room
+        // for the two steps the first quadratic model needs
+        globopt::BOBYQA<double> opt;
+        opt.setBounds(lb, ub);
+        opt.setParam("initial_trust_region_radius", 0.6);
+        check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+              "bobyqa: initial radius leaving no room between the bounds rejected");
+    }
+    {
+        globopt::BOBYQA<double> opt;
+        globopt::Vector<double> degenerate(2);
+        degenerate << 1.0, 1.0;
+        opt.setBounds(degenerate, degenerate);
+        check(opt.run(&sphere<double>, x0).status == globopt::Status::InvalidInput,
+              "bobyqa: empty box rejected");
+    }
+}
+
+void testBobyqaFloatScalar()
+{
+    auto opt = globopt::OptimizerFactory<float>::create("bobyqa");
+    opt->setParam("final_trust_region_radius", 1e-5);
+
+    globopt::Vector<float> lb(3), ub(3), x0(3);
+    lb << -10.0f, -10.0f, -10.0f;
+    ub << 10.0f, 10.0f, 10.0f;
+    x0 << 1.0f, -2.0f, 3.0f;
+    opt->setBounds(lb, ub);
+
+    const auto res = opt->run(&sphere<float>, x0);
+
+    check(res.success(), "bobyqa sphere<float>: converged");
+    check(res.x.norm() < 1e-3f, "bobyqa sphere<float>: solution near origin");
+}
+
 void testAmpgoBird()
 {
     // mirrors go_amp.py's __main__: Bird function, target set to the known
@@ -1412,7 +1634,7 @@ void testParamInterface()
     check(!opt->listParams().empty(), "params: listParams non-empty");
     check(std::string(opt->name()) == "L-BFGS", "optimizer: name");
 
-    check(globopt::OptimizerFactory<double>::available().size() == 7, "factory: seven optimizers available");
+    check(globopt::OptimizerFactory<double>::available().size() == 8, "factory: eight optimizers available");
     check(std::string(globopt::OptimizerFactory<double>::create("MaxLIPO")->name()) == "LIPO",
           "factory: LIPO by name");
     check(std::string(globopt::OptimizerFactory<double>::create("l-bfgs-b")->name()) == "L-BFGS-B",
@@ -1453,6 +1675,14 @@ int main()
     testLbfgsbConstrainedRosenbrock();
     testBoundaryOptimum();
     testLbfgsDelegatesBounded();
+    testBobyqaRosenbrock();
+    testBobyqaUnbounded();
+    testBobyqaBoundaryOptimum();
+    testBobyqaAnisotropicBox();
+    testBobyqaBudgetAndTarget();
+    testBobyqaPolishesGlobalResult();
+    testBobyqaParamValidation();
+    testBobyqaFloatScalar();
     testBenchmarkSuite();
     testAmpgoBird();
     testAmpgoSixHumpCamel();

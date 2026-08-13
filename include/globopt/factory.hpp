@@ -11,6 +11,7 @@
 #include "global/de.hpp"
 #include "global/ego.hpp"
 #include "global/lipo.hpp"
+#include "local/bobyqa.hpp"
 #include "local/lbfgs.hpp"
 #include "local/lbfgsb.hpp"
 
@@ -26,6 +27,7 @@ namespace globopt {
 enum class Algorithm {
     LBFGS,
     LBFGSB,
+    BOBYQA,
     AMPGO,
     LIPO,
     EGO,
@@ -43,6 +45,8 @@ public:
                 return std::make_unique<LBFGS<Scalar>>();
             case Algorithm::LBFGSB:
                 return std::make_unique<LBFGSB<Scalar>>();
+            case Algorithm::BOBYQA:
+                return std::make_unique<globopt::BOBYQA<Scalar>>();
             case Algorithm::AMPGO:
                 return std::make_unique<globopt::AMPGO<Scalar>>();
             case Algorithm::LIPO:
@@ -69,6 +73,9 @@ public:
         if (key == "lbfgsb") {
             return create(Algorithm::LBFGSB);
         }
+        if (key == "bobyqa") {
+            return create(Algorithm::BOBYQA);
+        }
         if (key == "ampgo") {
             return create(Algorithm::AMPGO);
         }
@@ -90,7 +97,7 @@ public:
 
     static std::vector<std::string> available()
     {
-        return {"L-BFGS", "L-BFGS-B", "AMPGO", "LIPO", "EGO", "CMA-ES", "DE"};
+        return {"L-BFGS", "L-BFGS-B", "BOBYQA", "AMPGO", "LIPO", "EGO", "CMA-ES", "DE"};
     }
 
 private:
